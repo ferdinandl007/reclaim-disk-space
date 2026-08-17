@@ -6,7 +6,7 @@ Traditional recursive scanners commonly call `readdir` and then `lstat` for ever
 
 Directory-level workers provide useful I/O concurrency without flooding the kernel with one task per file. Auto mode starts conservatively, measures metadata entries per second, probes higher concurrency, keeps increases only when they produce sustained marginal gain, and backs off otherwise. It periodically re-probes because warm cache and directory shape change during a scan. GPU acceleration does not help because directory enumeration and metadata retrieval are kernel and filesystem operations, while classification is cheap string matching.
 
-On Apple Silicon, each worker owns a reusable 1 MiB native result buffer aligned to the 16 KiB hardware page size. Telemetry counters are sharded per worker and aligned to 128 bytes to avoid cache-line ping-pong across performance and efficiency cores. The buffer is reused across directories, avoiding allocator and zero-fill churn on directory-heavy trees.
+On Apple Silicon, each worker owns a reusable 1 MiB native result buffer aligned to the 16 KiB hardware page size. Telemetry counters are sharded per worker and aligned to 128 bytes to avoid cache-line ping-pong across performance and efficiency cores. The buffer is reused across directories, avoiding allocator and zero-fill churn on directory-heavy trees. Max-throughput mode starts near half the logical-core count so short, directory-rich scans can use parallelism before the adaptive probe window elapses without paying for a full-core burst; interactive mode still starts at two workers.
 
 Child directories are opened with `openat` while their parent descriptor is already available and handed to workers through a bounded descriptor queue. This avoids repeating an absolute-path lookup from the volume root for every directory. The queue limit is derived from `RLIMIT_NOFILE`, uses at most one quarter of the process allowance, and is capped at 8,192. Paths fall back to ordinary open when the handoff window is full.
 
@@ -36,6 +36,7 @@ Private size is a conservative signal, not a transaction guarantee. Open files, 
 - Redirect TSV output to a file; do not stream millions of progress messages.
 - Keep the 1 MiB native per-directory buffer unless profiling proves a different size is materially better.
 - Benchmark elapsed time and correctness on the same warm or cold cache conditions before claiming a speedup.
+- The cleaner’s controller polls frequently enough to notice short batches without imposing a full telemetry interval before joining; its detailed host-load sampling remains bounded to the normal interval for larger batches.
 
 ## Incremental discovery
 

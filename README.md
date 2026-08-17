@@ -159,9 +159,11 @@ Use the benchmark harness to compare worker counts on a representative tree. It 
 
 ```sh
 scripts/benchmark-scan.sh "$HOME/Library" "1 2 4 8 16 32"
+scripts/benchmark-clean.sh "1 2 4 8" 8192
 ```
 
 Tune against the fastest run that keeps `permission_errors=0` and `partial_directories=0`; maximum worker count is hardware- and filesystem-dependent.
+The `make profile ROOT=/path/to/representative/tree` target runs both scanner and guarded-cleaner throughput sweeps and includes peak RSS from macOS process accounting. Use a disposable copy for the cleaner benchmark because its execute mode removes the fixture.
 
 - **AI:** Hugging Face, model servers, LM Studio, Ollama, PyTorch, Core ML, datasets, embeddings, checkpoints
 - **Apple:** Xcode DerivedData, archives, DeviceSupport, SwiftPM, CocoaPods, CoreSimulator devices and runtimes
@@ -173,7 +175,7 @@ Tune against the fastest run that keeps `permission_errors=0` and `partial_direc
 
 ## Performance without the fan apocalypse
 
-Directory workers are discovered rather than hardcoded. Interactive mode starts conservatively, probes useful concurrency, monitors its own CPU and host load, and backs off when metadata latency or contention rises. The ceiling is derived from logical CPUs, memory, file descriptors, and a generous safety cap, so the same binary can adapt to a different Apple Silicon machine.
+Directory workers are discovered rather than hardcoded. Interactive mode starts conservatively, probes useful concurrency, monitors its own CPU and host load, and backs off when metadata latency or contention rises. Max-throughput mode starts at roughly half the machine’s logical CPU count to avoid wasting a short scan in a one-second warm-up window, then continues probing and can back off if the measured rate deteriorates. The ceiling is derived from logical CPUs, memory, file descriptors, and a generous safety cap, so the same binary can adapt to a different Apple Silicon machine.
 
 GPU acceleration is intentionally not used: filesystem metadata enumeration is kernel/storage bound, while classification is cheap string matching. The useful acceleration is batched native metadata, bounded directory concurrency, hard-link deduplication, and fewer subprocesses.
 

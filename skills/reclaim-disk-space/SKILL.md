@@ -48,7 +48,7 @@ Build and run with:
 scripts/run-disk-scout.sh /System/Volumes/Data auto > /tmp/disk-scout-report.tsv
 ```
 
-The runner rebuilds when its Rust or C source changes. The scanner uses a macOS `getattrlistbulk` C shim, adaptive directory-level concurrency, hard-link deduplication, compact parent-linked directory records, streaming top-K lists, selective filesystem birth/modified-time queries, and no subprocess per file. `auto` is the default interactive profile: it lowers process priority, derives its exploration ceiling from cores, RAM, and descriptor limits, monitors its own CPU use and host load, backs off to preserve responsiveness, and periodically reprobes. Use `max-throughput` only for an explicitly approved unattended run. Pass an integer only for controlled benchmarks or debugging.
+The runner rebuilds when its Rust or C source changes. The scanner uses a macOS `getattrlistbulk` C shim, adaptive directory-level concurrency, hard-link deduplication, compact parent-linked directory records, streaming top-K lists, selective filesystem birth/modified-time queries, and no subprocess per file. `auto` is the default interactive profile: it lowers process priority, derives its exploration ceiling from cores, RAM, and descriptor limits, monitors its own CPU use and host load, backs off to preserve responsiveness, and periodically reprobes. `max-throughput` starts at roughly half the logical CPU count so short scans do not wait for a probe window, then continues adaptive probing; use it only for an explicitly approved unattended run. Pass an integer only for controlled benchmarks or debugging.
 
 For a focused scan:
 

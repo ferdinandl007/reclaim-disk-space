@@ -467,7 +467,11 @@ fn free_bytes(root: &Path) -> u64 {
 fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: usize, interactive: bool, logical_cpus: u32) -> DeleteStats {
     let nodes = Arc::new(nodes);
     let stats = Arc::new(DeleteStats::default());
-    let initial = maximum.min(2).max(1);
+    let initial = if interactive {
+        maximum.min(2).max(1)
+    } else {
+        ((logical_cpus as usize) / 2).max(4).min(maximum)
+    };
     stats.target_workers.store(initial, Ordering::Relaxed);
     let mut workers = Vec::new();
     for worker_id in 0..initial {
@@ -476,7 +480,8 @@ fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: 
     stats.workers_peak.store(workers.len(), Ordering::Relaxed);
 
     let started = Instant::now();
-    let mut last = Instant::now();
+    let mut last = started;
+    let mut next_sample = started;
     let mut last_completed = 0;
     let mut last_nanos = 0;
     let mut last_cpu_seconds = unsafe { ds_process_cpu_seconds() };
@@ -486,9 +491,16 @@ fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: 
     let mut best_rate = 0.0_f64;
     let mut hold_windows = 0_u8;
     while stats.completed.load(Ordering::Acquire) < nodes.len() {
-        thread::sleep(SAMPLE_INTERVAL);
-        let now = Instant::now();
         let completed = stats.completed.load(Ordering::Acquire);
+        if completed >= nodes.len() {
+            break;
+        }
+        let now = Instant::now();
+        if now < next_sample {
+            let remaining = next_sample.duration_since(now);
+            thread::sleep(remaining.min(Duration::from_millis(10)));
+            continue;
+        }
         let op_nanos = stats.op_nanos.load(Ordering::Relaxed);
         let elapsed = now.duration_since(last).as_secs_f64().max(0.001);
         let delta = completed.saturating_sub(last_completed);
@@ -587,6 +599,7 @@ fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: 
         last = now;
         last_completed = completed;
         last_nanos = op_nanos;
+        next_sample = now + SAMPLE_INTERVAL;
     }
     stats.stop.store(true, Ordering::Relaxed);
     for worker in workers { let _ = worker.join(); }

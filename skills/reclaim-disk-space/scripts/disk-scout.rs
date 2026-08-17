@@ -1768,7 +1768,15 @@ fn main() {
             .expect("THREADS must be an integer from 1 to 16384, or use auto/max-throughput")
             .clamp(1, ABSOLUTE_WORKER_CAP)
     };
-    let initial_workers = if auto_tune { 2.min(max_workers) } else { max_workers };
+    let initial_workers = if auto_tune {
+        if max_profile {
+            ((logical_cpus as usize) / 2).max(4).min(max_workers)
+        } else {
+            2.min(max_workers)
+        }
+    } else {
+        max_workers
+    };
 
     let root_metadata = fs::symlink_metadata(&root).expect("unable to stat root");
     let root_device = root_metadata.dev();
