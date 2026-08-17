@@ -1,0 +1,12 @@
+.DS_Store
+
+# Local build products
+skills/reclaim-disk-space/scripts/disk-scout
+skills/reclaim-disk-space/scripts/disk-clean
+skills/reclaim-disk-space/scripts/fsevents-since
+
+# Local reports and temporary outputs
+*.tsv
+*.jsonl
+*.report
+tmp/

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reclaim Disk Space"
+  short_description: "Audit and safely reclaim developer disk space"
+  default_prompt: "Use $reclaim-disk-space to scan my system, explain the largest developer and media storage consumers, and propose a safe cleanup plan."
