@@ -1,0 +1,31 @@
+name: Apple Silicon Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build arm64 release bundle
+        run: |
+          set -eu
+          ./scripts/build-release.sh "$RUNNER_TEMP/dist" "$GITHUB_REF_NAME"
+          (cd "$RUNNER_TEMP/dist" && shasum -a 256 *.tar.gz > SHA256SUMS)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/dist"/*.tar.gz \
+            "$RUNNER_TEMP/dist/SHA256SUMS" \
+            --title "Reclaim Disk Space $GITHUB_REF_NAME" \
+            --generate-notes

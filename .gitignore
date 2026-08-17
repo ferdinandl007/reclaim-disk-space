@@ -10,3 +10,4 @@ skills/reclaim-disk-space/scripts/fsevents-since
 *.jsonl
 *.report
 tmp/
+dist/

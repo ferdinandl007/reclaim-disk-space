@@ -13,6 +13,9 @@ jobs:
       - name: Build native tools
         run: make build
 
+      - name: Smoke-test release bundle
+        run: ./scripts/build-release.sh "$RUNNER_TEMP/dist" ci
+
       - name: Validate skill metadata
         run: |
           python3 - <<'PY'
@@ -28,4 +31,3 @@ jobs:
 
       - name: Check formatting
         run: git diff --check
-

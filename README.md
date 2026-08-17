@@ -1,6 +1,7 @@
 # Reclaim Disk Space
 
 [![macOS CI](https://github.com/ferdinandl007/reclaim-disk-space/actions/workflows/ci.yml/badge.svg)](https://github.com/ferdinandl007/reclaim-disk-space/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/ferdinandl007/reclaim-disk-space?display_name=tag&style=flat-square)](https://github.com/ferdinandl007/reclaim-disk-space/releases)
 
 Native, evidence-first disk auditing and guarded cleanup for macOS developer, AI, iOS, container, and media workstations.
 
@@ -32,6 +33,18 @@ skills/reclaim-disk-space/scripts/run-disk-clean.sh \
 Always run the read-only plan first and close the owning application. This tool cannot determine whether an application database, model, dataset, simulator, Docker volume, or project is personally important. Treat those as review candidates, not automatic cleanup.
 
 ## Quick start
+
+### From a release (Apple Silicon)
+
+If you are on an Apple Silicon Mac, download the latest `macos-arm64.tar.gz` from [Releases](https://github.com/ferdinandl007/reclaim-disk-space/releases), unpack it, and run:
+
+```sh
+./install.sh
+```
+
+This installs the prebuilt native tools and the Codex skill. It does not require a Rust compiler. The release is intentionally arm64-only; source builds remain available for development.
+
+### From source
 
 Requirements:
 
@@ -130,6 +143,8 @@ The first run creates a full report and records an FSEvents starting point. Late
 ## Development
 
 The project intentionally has no third-party Rust crates. Build scripts compile the C shim with `clang` and the Rust binaries with `rustc` using native optimization. Generated binaries are ignored by Git.
+
+Tagged releases are built on an Apple Silicon GitHub-hosted runner and publish an arm64 archive plus SHA-256 checksums. The archive includes the Codex skill, the Rust scanner, the guarded cleaner, and the FSEvents helper.
 
 Before opening a pull request:
 
