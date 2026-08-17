@@ -7,7 +7,7 @@ PROFILE ?= auto
 OUT ?= /tmp/reclaim-disk-space.tsv
 CONFIRM ?=
 
-.PHONY: build test scan plan delete clean
+.PHONY: build test scan plan delete profile clean
 
 build:
 	$(SCRIPTS)/build-disk-scout.sh
@@ -16,6 +16,9 @@ build:
 
 test: build
 	./scripts/test-safety.sh
+	./scripts/test-release.sh
+	./scripts/test-cleaner.sh
+	./scripts/test-incremental.sh
 	./scripts/test-scout.sh
 
 scan: build
@@ -28,6 +31,10 @@ plan: build
 delete: build
 	@test -n "$(CONFIRM)" || (echo 'Refusing deletion: pass CONFIRM=/exact/canonical/path' >&2; exit 2)
 	$(SCRIPTS)/run-disk-clean.sh --root "$(CONFIRM)" --execute --confirm "$(CONFIRM)" --workers auto --profile interactive
+
+profile: build
+	./scripts/benchmark-scan.sh "$(ROOT)" "1 2 4 8 16"
+	./scripts/benchmark-clean.sh "1 2 4 8" 8192
 
 clean:
 	@echo 'Use make delete CONFIRM=/exact/canonical/path for guarded deletion.'

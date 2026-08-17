@@ -9,7 +9,9 @@ SCANNER="$SCRIPT_DIR/disk-scout"
 REPORT="$CACHE_DIR/report.tsv"
 EVENT_ID="$CACHE_DIR/event-id"
 ROOT_FILE="$CACHE_DIR/root"
+SCANNER_FINGERPRINT_FILE="$CACHE_DIR/scanner-fingerprint"
 CHANGES="$CACHE_DIR/changes.tsv"
+SCHEMA_VERSION=2
 
 if [ ! -x "$EVENT_TOOL" ] || [ "$SCRIPT_DIR/fsevents-since.c" -nt "$EVENT_TOOL" ]; then
   "$SCRIPT_DIR/build-fsevents-since.sh" "$EVENT_TOOL" >/dev/null
@@ -21,8 +23,22 @@ if [ ! -x "$SCANNER" ] || \
 fi
 
 mkdir -p "$CACHE_DIR"
+LOCK_DIR="$CACHE_DIR/.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  printf 'CACHE_STATUS\tbusy\treason=another_incremental_scan_is_running\n'
+  exit 5
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
 
+SCANNER_FINGERPRINT=$(shasum -a 256 "$SCANNER" | awk '{print $1}')
+FULL_REASON=
 if [ ! -f "$REPORT" ] || [ ! -f "$EVENT_ID" ] || [ ! -f "$ROOT_FILE" ] || [ "$(sed -n '1p' "$ROOT_FILE")" != "$ROOT" ]; then
+  FULL_REASON=missing_or_root_changed
+elif [ ! -f "$SCANNER_FINGERPRINT_FILE" ] || [ "$(sed -n '1p' "$SCANNER_FINGERPRINT_FILE")" != "$SCHEMA_VERSION:$SCANNER_FINGERPRINT" ]; then
+  FULL_REASON=scanner_changed
+fi
+
+if [ -n "$FULL_REASON" ]; then
   START_EVENT=$($EVENT_TOOL --current)
   "$SCANNER" "$ROOT" auto > "$REPORT.tmp"
   mv "$REPORT.tmp" "$REPORT"
@@ -30,7 +46,9 @@ if [ ! -f "$REPORT" ] || [ ! -f "$EVENT_ID" ] || [ ! -f "$ROOT_FILE" ] || [ "$(s
   mv "$EVENT_ID.tmp" "$EVENT_ID"
   printf '%s\n' "$ROOT" > "$ROOT_FILE.tmp"
   mv "$ROOT_FILE.tmp" "$ROOT_FILE"
-  printf 'CACHE_STATUS\tfull_scan_created\tevent_id=%s\n' "$START_EVENT"
+  printf '%s\n' "$SCHEMA_VERSION:$SCANNER_FINGERPRINT" > "$SCANNER_FINGERPRINT_FILE.tmp"
+  mv "$SCANNER_FINGERPRINT_FILE.tmp" "$SCANNER_FINGERPRINT_FILE"
+  printf 'CACHE_STATUS\tfull_scan_created\treason=%s\tevent_id=%s\n' "$FULL_REASON" "$START_EVENT"
   cat "$REPORT"
   exit 0
 fi

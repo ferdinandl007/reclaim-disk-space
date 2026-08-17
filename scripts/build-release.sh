@@ -7,6 +7,14 @@ VERSION=${2:?usage: build-release.sh OUTPUT_ROOT VERSION}
 ARCH=arm64
 TARGET=aarch64-apple-darwin
 MIN_MACOS=13.0
+
+case "$VERSION" in
+  ''|.|..|*[!A-Za-z0-9._-]*)
+    echo "VERSION must contain only letters, numbers, dots, underscores, and hyphens" >&2
+    exit 2
+    ;;
+esac
+
 STAGE_NAME="reclaim-disk-space-${VERSION}-macos-arm64"
 STAGE="$OUTPUT_ROOT/$STAGE_NAME"
 BUILD_DIR=${TMPDIR:-/tmp}/reclaim-disk-space-release-build
@@ -67,4 +75,3 @@ file \
 
 tar -C "$OUTPUT_ROOT" -czf "$OUTPUT_ROOT/$STAGE_NAME.tar.gz" "$STAGE_NAME"
 printf '%s\n' "$OUTPUT_ROOT/$STAGE_NAME.tar.gz"
-

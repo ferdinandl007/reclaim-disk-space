@@ -48,7 +48,7 @@ Build and run with:
 scripts/run-disk-scout.sh /System/Volumes/Data auto > /tmp/disk-scout-report.tsv
 ```
 
-The runner rebuilds when its Rust or C source changes. The scanner uses a macOS `getattrlistbulk` C shim, adaptive directory-level concurrency, hard-link deduplication, compact parent-linked directory records, streaming top-K lists, selective filesystem birth/modified-time queries, and no subprocess per file. `auto` is the default interactive profile: it lowers process priority, derives its exploration ceiling from cores, RAM, and descriptor limits, monitors its own CPU use and host load, backs off to preserve responsiveness, and periodically reprobes. Use `max-throughput` only for an explicitly approved unattended run. Pass an integer only for controlled benchmarks or debugging.
+The runner rebuilds when its Rust or C source changes. The scanner uses a macOS `getattrlistbulk` C shim, adaptive directory-level concurrency, hard-link deduplication, compact parent-linked directory records, streaming top-K lists, selective filesystem birth/modified-time queries, and no subprocess per file. `auto` is the default interactive profile: it lowers process priority, derives its exploration ceiling from cores, RAM, and descriptor limits, monitors its own CPU use and host load, backs off to preserve responsiveness, and periodically reprobes. `max-throughput` starts at roughly half the logical CPU count so short scans do not wait for a probe window, then continues adaptive probing; use it only for an explicitly approved unattended run. Detailed per-directory scanner timing is disabled by default and is enabled only with `DISK_SCOUT_PROFILE=1`; the cleaner uses the analogous `DISK_CLEAN_PROFILE=1` flag. Pass an integer only for controlled benchmarks or debugging.
 
 For a focused scan:
 
@@ -62,15 +62,22 @@ Interpret output as follows:
 - `allocated`: allocated blocks attributed to files after hard-link deduplication; clones and snapshots can still make subtree sums differ from volume usage.
 - `logical`: apparent file lengths; sparse files and clones can make this misleading.
 - `tiny`, `small`, `small_text`: inode-heavy populations that can make tools and backups slow even when byte totals are moderate.
-- `EXTENSION`: dynamically discovered extension totals, including `<none>` and unknown formats. Semantic categories never replace this raw accounting.
+- `EXTENSION`: dynamically discovered extension totals, including `<none>` and unknown formats. Semantic categories never replace this raw accounting. To protect memory on adversarial trees, the extension index is capped and excess keys aggregate into `<other>`.
 - `timestamp_queries`: how many entries required an exact native timestamp lookup; a much smaller number than total entries is expected in the fast path.
+- `native_directories`, `fallback_directories`, and `partial_directories`: backend and completeness telemetry. A nonzero `partial_directories` or `permission_errors` makes the scanner exit nonzero unless `DISK_SCOUT_ALLOW_INCOMPLETE=1` is explicitly set.
 - `CATEGORY`: optional path and format-based interpretation for stores whose extensions alone are ambiguous.
 - `ENVIRONMENT`: every detected standard or marker-confirmed Python environment (`.venv`, `venv`, `virtualenv`, `.python`, or a directory containing `pyvenv.cfg`) plus Conda environments under Conda `envs` roots or containing `conda-meta`, with independent totals, newest modified epoch, age, and a `stale_review` hint. This is an inventory signal, not deletion authority.
-- `PROJECT`: detected Python, JavaScript, Rust, Go, iOS, Docker, JVM, and related project roots, with source/generated file totals, source activity age, and a stale-review hint. `stale_review=unknown` means source activity metadata was unavailable. A project is never automatically selected for deletion.
+- `PROJECT`: detected Python, JavaScript, Rust, Go, iOS, Docker, JVM, and related project roots, with source/generated file totals, source activity age, Git ref activity when a `.git` directory is present, repository overlap, and a stale-review hint. `activity_basis` keeps source and Git evidence explicit; generated activity never counts as source freshness. `stale_review=review` means old source plus recent Git metadata and requires human review. A project is never automatically selected for deletion.
+- `GIT_REPOSITORY`: bounded, read-only Git metadata for detected repositories: branch/HEAD, resolved HEAD object when safe, common object-store directory, ref and index mtimes, worktree/remote/submodule counts, and `worktree_state`. `worktree_state=unknown` is intentional until index comparison proves cleanliness; `in_progress` is a safety stop for merge/rebase/cherry-pick markers. No Git subprocesses or hooks are executed.
 - `EVIDENCE_SUMMARY`: total versus reported record counts, including any bounded-report truncation.
 - `VERSION_CLUSTER` and `VERSION_MEMBER`: conservative same-directory families such as `photo.jpg`, `photo v2.jpg`, `photo (3).jpg`, or exported app variants. They combine filename normalization, size similarity, and creation/modified-date proximity; `evidence_quality` exposes which signals were actually available, and `suggested_keep` is only a review starting point.
 - `TOP_*`: overlapping directory rankings. Select independent branches before summing.
-- `ERROR_PATH`: permission or per-entry failures. State blind spots rather than claiming full attribution.
+- `ERROR_PATH`: permission or per-entry failures with a reason. State blind spots rather than claiming full attribution.
+- `HARDLINK_SUMMARY`: duplicate accounting telemetry. The current fast path attributes shared inode bytes to the first observed path; reports mark that attribution as nondeterministic rather than pretending it is canonical.
+
+Machine-readable fields use TSV escaping: literal tabs, newlines, carriage returns, and backslashes are emitted as `\\t`, `\\n`, `\\r`, and `\\\\`. Agents should decode those sequences before displaying paths.
+
+The incremental helper invalidates its cached report when the scanner binary or report schema changes; a clean filesystem event stream alone is not enough to reuse an old report. It also takes an atomic cache lock and reports `CACHE_STATUS busy` rather than allowing concurrent writers to corrupt the cache.
 
 ## Investigation priorities
 
@@ -83,9 +90,11 @@ Review these surfaces when their categories or paths are prominent:
 - Media: Final Cut, Premiere, After Effects, DaVinci Resolve, Blender, proxies, optimized media, render caches, waveform or thumbnail caches, and raw project assets.
 - Applications: messaging attachments, browser or editor caches and state databases, local mail, Photos, cloud-sync offline copies, crash logs, and update or install remnants.
 
-When a cleanup candidate is old, inspect the matching `ENVIRONMENT`, `PROJECT`, or `VERSION_CLUSTER` records together with the exact path. Project age is based on the newest source/configuration activity observed, while generated/cache activity is reported separately; it can be unknown when metadata is unavailable and is deliberately a review hint rather than a hardcoded deletion rule.
+When a cleanup candidate is old, inspect the matching `ENVIRONMENT`, `PROJECT`, `GIT_REPOSITORY`, or `VERSION_CLUSTER` records together with the exact path. Project age is based on the newest source/configuration activity, with Git ref activity shown as a separate corroborating signal; generated/cache activity is reported separately. These are review hints rather than hardcoded deletion rules.
 
 Use [references/stack-cleanup-playbook.md](references/stack-cleanup-playbook.md) for stack-specific inspection and preferred cleanup mechanisms.
+
+The cleanup executor writes bounded deletion targets to a private temporary spool, then removes files through root-relative directory handles with device/inode/type revalidation. It refuses incomplete inventories and reports separate attempted, deleted, not-found, and error counts. A cleanup error or race mismatch is a failed deletion, never silent success.
 
 ## Reporting contract
 
