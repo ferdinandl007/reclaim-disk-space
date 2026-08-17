@@ -221,6 +221,7 @@ struct ScanResult {
     version_candidates: u64,
     version_candidates_skipped: u64,
     project_kind: Option<&'static str>,
+    environment_kind: Option<&'static str>,
     errors: Vec<PathBuf>,
     mounts_skipped: u64,
     entries_seen: u64,
@@ -989,6 +990,7 @@ fn scan_directory_native(
     let mut version_candidates = 0;
     let mut version_candidates_skipped = 0;
     let mut project_kind = None;
+    let mut environment_kind = None;
     let mut errors = Vec::new();
     let mut mounts_skipped = 0;
     let mut entries_seen = 0;
@@ -1023,6 +1025,9 @@ fn scan_directory_native(
         }
 
         project_kind = merge_project_kind(project_kind, project_marker_kind(&name));
+        let lower_entry_name = lower_name(&name);
+        if lower_entry_name == "pyvenv.cfg" { environment_kind = Some("python_venv"); }
+        if lower_entry_name == "conda-meta" { environment_kind = Some("conda_env"); }
         let entry_context = if entry.object_type == VDIR { derive_context(task.context, &name) } else { task.context };
         let (created_seconds, modified_seconds) = scanner.child_times(&name);
         if version_candidate_allowed(entry_context, &name, version_cluster_key(&name).map(|value| value.2).unwrap_or(false)) {
@@ -1080,7 +1085,7 @@ fn scan_directory_native(
     scanner.close();
 
     let (version_clusters, version_cluster_count) = finalize_version_groups(version_groups);
-    Some(ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, errors, mounts_skipped, entries_seen })
+    Some(ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, environment_kind, errors, mounts_skipped, entries_seen })
 }
 
 fn scan_directory_fallback(
@@ -1095,6 +1100,7 @@ fn scan_directory_fallback(
     let mut version_candidates = 0;
     let mut version_candidates_skipped = 0;
     let mut project_kind = None;
+    let mut environment_kind = None;
     let mut errors = Vec::new();
     let mut mounts_skipped = 0;
     let mut entries_seen = 0;
@@ -1118,6 +1124,9 @@ fn scan_directory_fallback(
 
                 let name = entry.file_name();
                 project_kind = merge_project_kind(project_kind, project_marker_kind(&name));
+                let lower_entry_name = lower_name(&name);
+                if lower_entry_name == "pyvenv.cfg" { environment_kind = Some("python_venv"); }
+                if lower_entry_name == "conda-meta" { environment_kind = Some("conda_env"); }
 
                 if file_type.is_dir() {
                     let context = derive_context(task.context, &name);
@@ -1150,7 +1159,7 @@ fn scan_directory_fallback(
     }
 
     let (version_clusters, version_cluster_count) = finalize_version_groups(version_groups);
-    ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, errors, mounts_skipped, entries_seen }
+    ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, environment_kind, errors, mounts_skipped, entries_seen }
 }
 
 fn scan_directory(
@@ -1235,6 +1244,9 @@ fn worker(
         for result in results {
             state.records[result.id as usize].direct = result.direct;
             state.records[result.id as usize].project_kind = result.project_kind;
+            if result.environment_kind.is_some() {
+                state.records[result.id as usize].environment_kind = result.environment_kind;
+            }
             state.version_cluster_count = state.version_cluster_count.saturating_add(result.version_cluster_count);
             state.version_candidates = state.version_candidates.saturating_add(result.version_candidates);
             state.version_candidates_skipped = state.version_candidates_skipped.saturating_add(result.version_candidates_skipped);

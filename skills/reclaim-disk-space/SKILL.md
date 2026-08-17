@@ -64,7 +64,7 @@ Interpret output as follows:
 - `tiny`, `small`, `small_text`: inode-heavy populations that can make tools and backups slow even when byte totals are moderate.
 - `EXTENSION`: dynamically discovered extension totals, including `<none>` and unknown formats. Semantic categories never replace this raw accounting.
 - `CATEGORY`: optional path and format-based interpretation for stores whose extensions alone are ambiguous.
-- `ENVIRONMENT`: every detected `.venv`/`venv`/`virtualenv` and Conda environment under Conda `envs` roots, with independent totals, newest modified epoch, age, and a `stale_review` hint. This is an inventory signal, not deletion authority.
+- `ENVIRONMENT`: every detected standard or marker-confirmed Python environment (`.venv`, `venv`, `virtualenv`, `.python`, or a directory containing `pyvenv.cfg`) plus Conda environments under Conda `envs` roots or containing `conda-meta`, with independent totals, newest modified epoch, age, and a `stale_review` hint. This is an inventory signal, not deletion authority.
 - `PROJECT`: detected Python, JavaScript, Rust, Go, iOS, Docker, JVM, and related project roots, with independent totals and an age-based stale-review hint. A project is never automatically selected for deletion.
 - `VERSION_CLUSTER` and `VERSION_MEMBER`: conservative same-directory families such as `photo.jpg`, `photo v2.jpg`, `photo (3).jpg`, or exported app variants. They combine filename normalization, size similarity, and creation/modified-date proximity; `suggested_keep` is only a review starting point.
 - `TOP_*`: overlapping directory rankings. Select independent branches before summing.
