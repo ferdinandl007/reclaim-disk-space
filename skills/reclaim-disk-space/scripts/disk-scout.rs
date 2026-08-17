@@ -5,7 +5,9 @@ use std::env;
 use std::ffi::{c_char, c_int, c_void, CString, OsStr, OsString};
 use std::mem::MaybeUninit;
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -118,6 +120,11 @@ const CTX_MEDIA_PRODUCTION: u32 = 1 << 20;
 const CTX_INFRA: u32 = 1 << 21;
 const CTX_CONDA: u32 = 1 << 22;
 const CTX_PROJECT_TREE: u32 = 1 << 23;
+const CTX_UV: u32 = 1 << 24;
+const CTX_PYTHON_PACKAGE: u32 = 1 << 25;
+
+const ARTIFACT_MAGIC: &[u8; 8] = b"RDSIDX01";
+const ARTIFACT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Default)]
 struct Metrics {
@@ -227,6 +234,18 @@ impl CategoryTotals {
 }
 
 struct DirectoryRecord {
+    name: OsString,
+    parent: Option<u32>,
+    context: u32,
+    direct: Metrics,
+    total: Metrics,
+    environment_kind: Option<&'static str>,
+    project_kind: Option<&'static str>,
+    git_evidence: Option<GitEvidence>,
+}
+
+#[derive(Clone)]
+struct ArtifactRecord {
     name: OsString,
     parent: Option<u32>,
     context: u32,
@@ -663,12 +682,18 @@ fn derive_context_lower(parent: u32, value: &Cow<'_, str>) -> u32 {
     if matches!(value.as_ref(), ".venv" | "venv" | "virtualenv" | "site-packages" | "__pycache__" | ".tox" | ".nox") {
         context |= CTX_PYTHON_DEPS;
     }
+    if value == "site-packages" && parent & CTX_PYTHON_DEPS != 0 {
+        context |= CTX_PYTHON_PACKAGE;
+    }
     if matches!(value.as_ref(), ".conda" | "conda" | "conda3" | "miniconda" | "miniconda3" | "anaconda" | "anaconda3") {
         context |= CTX_CONDA | CTX_PYTHON_DEPS;
     }
     if value == "node_modules" { context |= CTX_JS_DEPS; }
-    if matches!(value.as_ref(), ".npm" | ".pnpm-store" | "pnpm" | "yarn" | "pip" | "cocoapods" | "homebrew" | "archive-v0" | "wheels-v5" | "simple-v18") {
+    if matches!(value.as_ref(), ".npm" | ".pnpm-store" | "pnpm" | "yarn" | "pip" | "uv" | "cocoapods" | "homebrew" | "archive-v0" | "wheels-v5" | "simple-v18") {
         context |= CTX_PACKAGE_CACHE;
+    }
+    if value == "pkgs" && parent & CTX_CONDA != 0 {
+        context |= CTX_PYTHON_PACKAGE;
     }
     if matches!(value.as_ref(), "deriveddata" | "coresimulator" | "device support" | "ios devicesupport" | "archives") || value.ends_with(".xcarchive") || value.ends_with(".dsym") {
         context |= CTX_XCODE;
@@ -1011,7 +1036,7 @@ fn finalize_version_groups(groups: HashMap<String, Vec<VersionCandidate>>) -> (V
 
 fn project_marker_kind_lower(value: &str) -> Option<&'static str> {
     if value == ".git" { Some("git_project") }
-    else if matches!(value, "pyproject.toml" | "setup.py" | "requirements.txt" | "environment.yml" | "environment.yaml") { Some("python_project") }
+    else if matches!(value, "pyproject.toml" | "setup.py" | "requirements.txt" | "environment.yml" | "environment.yaml" | "uv.lock") { Some("python_project") }
     else if matches!(value, "package.json" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock") { Some("javascript_project") }
     else if value == "cargo.toml" { Some("rust_project") }
     else if matches!(value, "go.mod" | "go.work") { Some("go_project") }
@@ -1216,7 +1241,9 @@ fn inspect_git_evidence(root: &Path) -> Option<GitEvidence> {
 fn environment_kind_for_child(parent_name: &OsStr, child_name: &OsStr, parent_context: u32) -> Option<&'static str> {
     let child = lower_name(child_name);
     let parent = lower_name(parent_name);
-    if matches!(child.as_ref(), ".venv" | "venv" | "virtualenv" | ".python") { return Some("python_venv"); }
+    if matches!(child.as_ref(), ".venv" | "venv" | "virtualenv" | ".python") {
+        return Some(if parent_context & CTX_UV != 0 { "uv_venv" } else { "python_venv" });
+    }
     if parent == "envs" && parent_context & CTX_CONDA != 0 { return Some("conda_env"); }
     None
 }
@@ -1288,6 +1315,7 @@ fn scan_directory_native(
     let mut version_candidates_skipped = 0;
     let mut project_kind = None;
     let mut environment_kind = None;
+    let mut child_context_base = task.context;
     let mut git_marker = false;
     let mut timestamp_queries = 0;
     let mut timestamp_failures = 0;
@@ -1332,11 +1360,12 @@ fn scan_directory_native(
 
         let lower_entry_name = lower_name(&name);
         project_kind = merge_project_kind(project_kind, project_marker_kind_lower(lower_entry_name.as_ref()));
+        if lower_entry_name == "uv.lock" { child_context_base |= CTX_UV; }
         if lower_entry_name == ".git" { git_marker = true; }
-        if lower_entry_name == "pyvenv.cfg" { environment_kind = Some("python_venv"); }
+        if lower_entry_name == "pyvenv.cfg" { environment_kind = Some(if task.context & CTX_UV != 0 { "uv_venv" } else { "python_venv" }); }
         if lower_entry_name == "conda-meta" { environment_kind = Some("conda_env"); }
         let extension = extension(&name);
-        let entry_context = if entry.object_type == VDIR { derive_context_lower(task.context, &lower_entry_name) } else { task.context };
+        let entry_context = if entry.object_type == VDIR { derive_context_lower(child_context_base, &lower_entry_name) } else { task.context };
         let classification = if entry.object_type == VREG {
             classify_file(task.context, &lower_entry_name, &extension)
         } else {
@@ -1454,6 +1483,7 @@ fn scan_directory_fallback(
     let mut version_candidates_skipped = 0;
     let mut project_kind = None;
     let mut environment_kind = None;
+    let mut child_context_base = task.context;
     let mut git_marker = false;
     let mut timestamp_queries = 0;
     let mut errors = Vec::new();
@@ -1481,8 +1511,9 @@ fn scan_directory_fallback(
                 let name = entry.file_name();
                 let lower_entry_name = lower_name(&name);
                 project_kind = merge_project_kind(project_kind, project_marker_kind_lower(lower_entry_name.as_ref()));
+                if lower_entry_name == "uv.lock" { child_context_base |= CTX_UV; }
                 if lower_entry_name == ".git" { git_marker = true; }
-                if lower_entry_name == "pyvenv.cfg" { environment_kind = Some("python_venv"); }
+                if lower_entry_name == "pyvenv.cfg" { environment_kind = Some(if task.context & CTX_UV != 0 { "uv_venv" } else { "python_venv" }); }
                 if lower_entry_name == "conda-meta" { environment_kind = Some("conda_env"); }
                 let extension = extension(&name);
                 let classification = classify_file(task.context, &lower_entry_name, &extension);
@@ -1495,7 +1526,7 @@ fn scan_directory_fallback(
                 };
 
                 if file_type.is_dir() {
-                    let context = derive_context_lower(task.context, &lower_entry_name);
+                    let context = derive_context_lower(child_context_base, &lower_entry_name);
                     let created_seconds = metadata.created().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     let modified_seconds = metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     timestamp_queries += 1;
@@ -1792,10 +1823,469 @@ fn print_top(
     }
 }
 
+fn write_u8(file: &mut fs::File, value: u8) -> std::io::Result<()> { file.write_all(&[value]) }
+
+fn write_u32(file: &mut fs::File, value: u32) -> std::io::Result<()> { file.write_all(&value.to_le_bytes()) }
+
+fn write_u64(file: &mut fs::File, value: u64) -> std::io::Result<()> { file.write_all(&value.to_le_bytes()) }
+
+fn write_bytes(file: &mut fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    write_u32(file, bytes.len().min(u32::MAX as usize) as u32)?;
+    file.write_all(&bytes[..bytes.len().min(u32::MAX as usize)])
+}
+
+fn write_metrics(file: &mut fs::File, metrics: Metrics) -> std::io::Result<()> {
+    for value in [
+        metrics.logical,
+        metrics.physical,
+        metrics.private,
+        metrics.files,
+        metrics.tiny,
+        metrics.small,
+        metrics.small_text,
+        metrics.newest_modified_seconds,
+        metrics.newest_source_modified_seconds,
+        metrics.newest_generated_modified_seconds,
+        metrics.source_files,
+        metrics.generated_files,
+    ] {
+        write_u64(file, value)?;
+    }
+    Ok(())
+}
+
+fn write_git_evidence(file: &mut fs::File, git: &GitEvidence) -> std::io::Result<()> {
+    for value in [&git.branch, &git.head_ref, &git.head_oid, &git.common_git_dir] { write_bytes(file, value.as_bytes())?; }
+    write_bytes(file, git.worktree_state.as_bytes())?;
+    for value in [git.ref_activity_seconds, git.index_modified_seconds, git.metadata_bytes, git.worktree_count, git.locked_worktree_count, git.prunable_worktree_count, git.remote_count, git.submodule_count, git.index_entries, git.modified_tracked_files, git.deleted_tracked_files] { write_u64(file, value)?; }
+    Ok(())
+}
+
+fn environment_kind_code(kind: Option<&str>) -> u8 {
+    match kind {
+        Some("python_venv") => 1,
+        Some("conda_env") => 2,
+        Some("uv_venv") => 3,
+        _ => 0,
+    }
+}
+
+fn environment_kind_from_code(code: u8) -> Option<&'static str> {
+    match code {
+        1 => Some("python_venv"),
+        2 => Some("conda_env"),
+        3 => Some("uv_venv"),
+        _ => None,
+    }
+}
+
+fn project_kind_code(kind: Option<&str>) -> u8 {
+    match kind {
+        Some("git_project") => 1,
+        Some("python_project") => 2,
+        Some("javascript_project") => 3,
+        Some("rust_project") => 4,
+        Some("go_project") => 5,
+        Some("ios_project") => 6,
+        Some("docker_project") => 7,
+        Some("jvm_project") => 8,
+        Some("ruby_php_project") => 9,
+        _ => 0,
+    }
+}
+
+fn project_kind_from_code(code: u8) -> Option<&'static str> {
+    match code {
+        1 => Some("git_project"),
+        2 => Some("python_project"),
+        3 => Some("javascript_project"),
+        4 => Some("rust_project"),
+        5 => Some("go_project"),
+        6 => Some("ios_project"),
+        7 => Some("docker_project"),
+        8 => Some("jvm_project"),
+        9 => Some("ruby_php_project"),
+        _ => None,
+    }
+}
+
+fn write_artifact(path: &Path, root: &Path, records: &[DirectoryRecord]) -> std::io::Result<()> {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_nanos()).unwrap_or(0);
+    let temporary = path.with_extension(format!("tmp.{}.{}", std::process::id(), nonce));
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(ARTIFACT_MAGIC)?;
+    write_u32(&mut file, ARTIFACT_VERSION)?;
+    write_u64(&mut file, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0))?;
+    write_bytes(&mut file, root.as_os_str().as_bytes())?;
+    write_u32(&mut file, records.len().min(u32::MAX as usize) as u32)?;
+    for record in records.iter().take(u32::MAX as usize) {
+        write_u32(&mut file, record.parent.unwrap_or(u32::MAX))?;
+        write_bytes(&mut file, record.name.as_bytes())?;
+        write_u32(&mut file, record.context)?;
+        write_u8(&mut file, environment_kind_code(record.environment_kind))?;
+        write_u8(&mut file, project_kind_code(record.project_kind))?;
+        write_u8(&mut file, if record.git_evidence.is_some() { 1 } else { 0 })?;
+        if let Some(git) = record.git_evidence.as_ref() { write_git_evidence(&mut file, git)?; }
+        write_metrics(&mut file, record.direct)?;
+        write_metrics(&mut file, record.total)?;
+    }
+    file.sync_all()?;
+    fs::rename(temporary, path)
+}
+
+fn read_u8(file: &mut fs::File) -> std::io::Result<u8> {
+    let mut bytes = [0u8; 1];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes[0])
+}
+
+fn read_u32(file: &mut fs::File) -> std::io::Result<u32> {
+    let mut bytes = [0u8; 4];
+    file.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(file: &mut fs::File) -> std::io::Result<u64> {
+    let mut bytes = [0u8; 8];
+    file.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_bytes(file: &mut fs::File) -> std::io::Result<Vec<u8>> {
+    let length = read_u32(file)? as usize;
+    if length > 64 * 1024 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "artifact string is too large"));
+    }
+    let mut bytes = vec![0u8; length];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_metrics(file: &mut fs::File) -> std::io::Result<Metrics> {
+    let mut values = [0u64; 12];
+    for value in &mut values { *value = read_u64(file)?; }
+    Ok(Metrics {
+        logical: values[0],
+        physical: values[1],
+        private: values[2],
+        files: values[3],
+        tiny: values[4],
+        small: values[5],
+        small_text: values[6],
+        newest_modified_seconds: values[7],
+        newest_source_modified_seconds: values[8],
+        newest_generated_modified_seconds: values[9],
+        source_files: values[10],
+        generated_files: values[11],
+    })
+}
+
+fn read_text(file: &mut fs::File) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&read_bytes(file)?).into_owned())
+}
+
+fn read_git_evidence(file: &mut fs::File) -> std::io::Result<GitEvidence> {
+    let branch = read_text(file)?;
+    let head_ref = read_text(file)?;
+    let head_oid = read_text(file)?;
+    let common_git_dir = read_text(file)?;
+    let worktree_state = match read_text(file)?.as_str() {
+        "dirty" => "dirty",
+        "in_progress" => "in_progress",
+        "clean" => "clean",
+        _ => "unknown",
+    };
+    let mut values = [0u64; 11];
+    for value in &mut values { *value = read_u64(file)?; }
+    Ok(GitEvidence { branch, head_ref, head_oid, common_git_dir, worktree_state, ref_activity_seconds: values[0], index_modified_seconds: values[1], metadata_bytes: values[2], worktree_count: values[3], locked_worktree_count: values[4], prunable_worktree_count: values[5], remote_count: values[6], submodule_count: values[7], index_entries: values[8], modified_tracked_files: values[9], deleted_tracked_files: values[10] })
+}
+
+fn read_artifact(path: &Path) -> std::io::Result<(PathBuf, Vec<ArtifactRecord>)> {
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)?;
+    if &magic != ARTIFACT_MAGIC { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown artifact format")); }
+    let version = read_u32(&mut file)?;
+    if version != ARTIFACT_VERSION { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unsupported artifact version")); }
+    let _scan_epoch = read_u64(&mut file)?;
+    let root = PathBuf::from(OsString::from_vec(read_bytes(&mut file)?));
+    let count = read_u32(&mut file)? as usize;
+    if count > MAX_DIRECTORY_RECORDS { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "artifact directory count exceeds safety limit")); }
+    if count == 0 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "artifact has no root record")); }
+    let mut records = Vec::with_capacity(count);
+    for index in 0..count {
+        let parent = match read_u32(&mut file)? {
+            value if value == u32::MAX => None,
+            value if value < index as u32 => Some(value),
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "artifact parent link is invalid")),
+        };
+        if index == 0 && parent.is_some() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "artifact root has a parent"));
+        }
+        let name = OsString::from_vec(read_bytes(&mut file)?);
+        let context = read_u32(&mut file)?;
+        let environment_kind = environment_kind_from_code(read_u8(&mut file)?);
+        let project_kind = project_kind_from_code(read_u8(&mut file)?);
+        let git_evidence = if read_u8(&mut file)? != 0 { Some(read_git_evidence(&mut file)?) } else { None };
+        let direct = read_metrics(&mut file)?;
+        let total = read_metrics(&mut file)?;
+        records.push(ArtifactRecord { name, parent, context, direct, total, environment_kind, project_kind, git_evidence });
+    }
+    Ok((root, records))
+}
+
+fn artifact_path_for(root: &Path, records: &[ArtifactRecord], mut id: u32) -> PathBuf {
+    let mut names = Vec::new();
+    loop {
+        let record = &records[id as usize];
+        if !record.name.is_empty() { names.push(record.name.clone()); }
+        match record.parent { Some(parent) => id = parent, None => break }
+    }
+    let mut path = root.to_path_buf();
+    for name in names.into_iter().rev() { path.push(name); }
+    path
+}
+
+fn artifact_children(records: &[ArtifactRecord]) -> Vec<Vec<u32>> {
+    let mut children = (0..records.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (id, record) in records.iter().enumerate() {
+        if let Some(parent) = record.parent {
+            if let Some(bucket) = children.get_mut(parent as usize) { bucket.push(id as u32); }
+        }
+    }
+    children
+}
+
+fn artifact_depth(records: &[ArtifactRecord], mut id: u32) -> usize {
+    let mut depth = 0;
+    while let Some(parent) = records[id as usize].parent {
+        depth += 1;
+        id = parent;
+        if depth > records.len() { break; }
+    }
+    depth
+}
+
+fn artifact_non_overlapping(records: &[ArtifactRecord], ids: &mut Vec<u32>) {
+    ids.sort_unstable_by_key(|id| artifact_depth(records, *id));
+    let mut selected = HashSet::new();
+    ids.retain(|id| {
+        let mut cursor = records[*id as usize].parent;
+        while let Some(parent) = cursor {
+            if selected.contains(&parent) { return false; }
+            cursor = records[parent as usize].parent;
+        }
+        selected.insert(*id);
+        true
+    });
+}
+
+fn artifact_metric(record: &ArtifactRecord, metric: &str) -> u64 {
+    match metric {
+        "allocated" | "physical" => record.total.physical,
+        "logical" => record.total.logical,
+        "files" => record.total.files,
+        "tiny" => record.total.tiny,
+        "small_text" => record.total.small_text,
+        _ => record.total.private,
+    }
+}
+
+fn package_scope_kind(record: &ArtifactRecord) -> Option<&'static str> {
+    let name = lower_name(&record.name);
+    if record.context & CTX_PYTHON_PACKAGE != 0 {
+        if name == "pkgs" { return Some("conda_packages"); }
+        if name == "site-packages" { return Some("python_site_packages"); }
+        return Some("python_packages");
+    }
+    if record.context & CTX_JS_DEPS != 0 && name == "node_modules" { return Some("javascript_dependencies"); }
+    if record.context & CTX_RUST != 0 {
+        if matches!(name.as_ref(), ".cargo" | "cargo" | "rustup" | ".rustup" | "registry" | "git") { return Some("rust_cargo"); }
+    }
+    if record.context & CTX_JVM != 0 && matches!(name.as_ref(), ".gradle" | "gradle" | ".m2" | "maven" | ".ivy2" | "ivy2") {
+        return Some("jvm_gradle_maven");
+    }
+    if record.context & CTX_GO != 0 && matches!(name.as_ref(), "go-build" | "gomodcache" | "gopath" | "pkg" | "mod") {
+        return Some("go_modules");
+    }
+    if record.context & CTX_DOTNET != 0 && matches!(name.as_ref(), ".nuget" | "nuget" | "packages") {
+        return Some("dotnet_nuget");
+    }
+    if record.context & CTX_RUBY_PHP != 0 && matches!(name.as_ref(), "vendor" | "bundle" | ".bundle") {
+        return Some("ruby_php_dependencies");
+    }
+    if record.context & CTX_PACKAGE_CACHE != 0 {
+        return match name.as_ref() {
+            ".npm" => Some("npm_cache"),
+            ".pnpm-store" | "pnpm" => Some("pnpm_cache"),
+            "pip" => Some("pip_cache"),
+            "uv" => Some("uv_cache"),
+            "cocoapods" => Some("cocoapods_cache"),
+            "yarn" => Some("yarn_cache"),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn age_days_label(epoch: u64, now: u64) -> String {
+    if epoch > 0 && now >= epoch { ((now - epoch) / 86_400).to_string() } else { "unknown".to_string() }
+}
+
+fn print_artifact_record(label: &str, root: &Path, records: &[ArtifactRecord], id: u32) {
+    let record = &records[id as usize];
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0);
+    let age = age_days_label(record.total.newest_modified_seconds, now);
+    let source_age = age_days_label(record.total.newest_source_modified_seconds, now);
+    let generated_age = age_days_label(record.total.newest_generated_modified_seconds, now);
+    let stale_review = match source_age.parse::<u64>() { Ok(age) => if age >= STALE_REVIEW_DAYS { "true" } else { "false" }, Err(_) => "unknown" };
+    let git_branch = record.git_evidence.as_ref().map(|git| git.branch.as_str()).unwrap_or("unknown");
+    let git_head_oid = record.git_evidence.as_ref().map(|git| git.head_oid.as_str()).unwrap_or("unknown");
+    let git_worktree_state = record.git_evidence.as_ref().map(|git| git.worktree_state).unwrap_or("unknown");
+    let git_ref_activity_epoch = record.git_evidence.as_ref().map(|git| git.ref_activity_seconds).unwrap_or(0);
+    let scope_kind = if label == "PACKAGE_SCOPE" { package_scope_kind(record).unwrap_or("package_scope") } else { "none" };
+    println!(
+        "{label}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tdirect_private_bytes={}\tdirect_allocated_bytes={}\tdirect_logical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\ttiny={}\tsmall_text={}\tnewest_modified_epoch={}\tage_days={}\tsource_age_days={}\tgenerated_age_days={}\tstale_review={}\tcontext={}\tenvironment={}\tproject={}\tscope_kind={}\tgit_branch={}\tgit_head_oid={}\tgit_worktree_state={}\tgit_ref_activity_epoch={}\tpath={}",
+        record.total.private,
+        record.total.physical,
+        record.total.logical,
+        record.direct.private,
+        record.direct.physical,
+        record.direct.logical,
+        format_size(record.total.private),
+        format_size(record.total.physical),
+        format_size(record.total.logical),
+        record.total.files,
+        record.total.tiny,
+        record.total.small_text,
+        record.total.newest_modified_seconds,
+        age,
+        source_age,
+        generated_age,
+        stale_review,
+        context_label(record.context),
+        record.environment_kind.unwrap_or("none"),
+        record.project_kind.unwrap_or("none"),
+        scope_kind,
+        escape_tsv(git_branch),
+        escape_tsv(git_head_oid),
+        git_worktree_state,
+        git_ref_activity_epoch,
+        escape_path(&artifact_path_for(root, records, id)),
+    );
+}
+
+fn query_artifact(arguments: &[OsString]) {
+    let artifact = PathBuf::from(arguments.first().expect("usage: disk-scout query ARTIFACT [summary|path|independent|environments|packages|projects]"));
+    let mode = arguments.get(1).and_then(|value| value.to_str()).unwrap_or("summary");
+    let (root, records) = read_artifact(&artifact).unwrap_or_else(|error| panic!("unable to read artifact {}: {error}", artifact.display()));
+    let children = artifact_children(&records);
+    match mode {
+        "summary" => {
+            let root_record = &records[0];
+            println!("ARTIFACT_SUMMARY\tartifact={}\troot={}\tdirectories={}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tenvironments={}\tprojects={}\toverlap=false", escape_path(&artifact), escape_path(&root), records.len(), root_record.total.private, root_record.total.physical, root_record.total.logical, format_size(root_record.total.private), format_size(root_record.total.physical), format_size(root_record.total.logical), records.iter().filter(|record| record.environment_kind.is_some()).count(), records.iter().filter(|record| record.project_kind.is_some()).count());
+        }
+        "path" => {
+            let target = PathBuf::from(arguments.get(2).expect("usage: disk-scout query ARTIFACT path PATH"));
+            let target = if target.strip_prefix(&root).is_err() && root == Path::new("/System/Volumes/Data") && target.starts_with("/Users") {
+                root.join(target.strip_prefix("/").unwrap_or_else(|_| Path::new("")))
+            } else { target };
+            let mut current = if target == root { Some(0u32) } else { target.strip_prefix(&root).ok().and_then(|relative| {
+                let mut id = 0u32;
+                for component in relative.components() {
+                    let wanted = component.as_os_str();
+                    id = children[id as usize].iter().copied().find(|child| records[*child as usize].name.to_string_lossy().eq_ignore_ascii_case(&wanted.to_string_lossy()))?;
+                }
+                Some(id)
+            }) };
+            if let Some(id) = current.take() {
+                print_artifact_record("PATH", &root, &records, id);
+                let mut child_ids = children[id as usize].clone();
+                child_ids.sort_unstable_by(|a, b| records[*b as usize].total.private.cmp(&records[*a as usize].total.private));
+                for child in child_ids.into_iter().take(100) { print_artifact_record("CHILD", &root, &records, child); }
+            } else {
+                eprintln!("path is not present in artifact: {}", target.display());
+                std::process::exit(2);
+            }
+        }
+        "independent" => {
+            let metric = arguments.get(2).and_then(|value| value.to_str()).unwrap_or("private");
+            let limit = arguments.get(3).and_then(|value| value.to_str()).and_then(|value| value.parse::<usize>().ok()).unwrap_or(TOP_K).clamp(1, 1000);
+            let mut frontier = children[0].clone();
+            while frontier.len() < limit {
+                let candidate = frontier.iter().enumerate().max_by_key(|(_, id)| artifact_metric(&records[**id as usize], metric)).map(|(index, _)| index);
+                let Some(index) = candidate else { break };
+                let id = frontier[index];
+                if children[id as usize].is_empty() { break; }
+                let remaining = limit.saturating_sub(frontier.len()).saturating_add(1);
+                let mut replacements = children[id as usize].clone();
+                replacements.sort_unstable_by(|a, b| artifact_metric(&records[*b as usize], metric).cmp(&artifact_metric(&records[*a as usize], metric)));
+                replacements.truncate(remaining);
+                frontier.remove(index);
+                frontier.extend(replacements);
+            }
+            frontier.sort_unstable_by(|a, b| artifact_metric(&records[*b as usize], metric).cmp(&artifact_metric(&records[*a as usize], metric)));
+            println!("INDEPENDENT_SUMMARY\tmetric={}\tcount={}\toverlap=false", metric, frontier.len());
+            for id in frontier.into_iter().take(limit) { print_artifact_record("INDEPENDENT", &root, &records, id); }
+        }
+        "environments" => {
+            let mut ids = records.iter().enumerate().filter_map(|(id, record)| record.environment_kind.map(|_| id as u32)).collect::<Vec<_>>();
+            artifact_non_overlapping(&records, &mut ids);
+            ids.sort_unstable_by(|a, b| records[*b as usize].total.private.cmp(&records[*a as usize].total.private));
+            let mut totals: HashMap<&str, Metrics> = HashMap::new();
+            for id in &ids { let kind = records[*id as usize].environment_kind.unwrap_or("unknown"); totals.entry(kind).or_default().add_assign(records[*id as usize].total); }
+            println!("ENVIRONMENT_SUMMARY\tcount={}\toverlap=false", ids.len());
+            for (kind, metric) in totals { println!("ENVIRONMENT_TOTAL\tkind={kind}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\ttiny={}\tsmall_text={}", metric.private, metric.physical, metric.logical, format_size(metric.private), format_size(metric.physical), format_size(metric.logical), metric.files, metric.tiny, metric.small_text); }
+            for id in ids { print_artifact_record("ENVIRONMENT", &root, &records, id); }
+        }
+        "packages" => {
+            let mut ids = records.iter().enumerate().filter_map(|(id, record)| {
+                let parent_context = record.parent.map(|parent| records[parent as usize].context).unwrap_or(0);
+                let package_boundary = record.context & CTX_PYTHON_PACKAGE != 0 && parent_context & CTX_PYTHON_PACKAGE == 0;
+                let dependency_boundary = package_scope_kind(record).is_some() && record.context & (CTX_PYTHON_PACKAGE | CTX_JS_DEPS | CTX_RUST | CTX_JVM | CTX_GO | CTX_DOTNET | CTX_RUBY_PHP) != 0 && parent_context & (CTX_PYTHON_PACKAGE | CTX_JS_DEPS | CTX_RUST | CTX_JVM | CTX_GO | CTX_DOTNET | CTX_RUBY_PHP) == 0;
+                let cache_name = lower_name(&record.name);
+                let cache_boundary = record.context & CTX_PACKAGE_CACHE != 0 && parent_context & CTX_PACKAGE_CACHE == 0 && matches!(cache_name.as_ref(), ".npm" | ".pnpm-store" | "pip" | "uv" | "cocoapods" | "yarn");
+                (package_boundary || dependency_boundary || cache_boundary).then_some(id as u32)
+            }).collect::<Vec<_>>();
+            artifact_non_overlapping(&records, &mut ids);
+            ids.sort_unstable_by(|a, b| records[*b as usize].total.private.cmp(&records[*a as usize].total.private));
+            println!("PACKAGE_SUMMARY\tcount={}\toverlap=false", ids.len());
+            let mut totals: HashMap<&str, Metrics> = HashMap::new();
+            for id in &ids {
+                let kind = package_scope_kind(&records[*id as usize]).unwrap_or("package_scope");
+                totals.entry(kind).or_default().add_assign(records[*id as usize].total);
+            }
+            let mut total_kinds = totals.into_iter().collect::<Vec<_>>();
+            total_kinds.sort_unstable_by(|a, b| b.1.private.cmp(&a.1.private));
+            for (kind, metric) in total_kinds {
+                println!("PACKAGE_TOTAL\tkind={kind}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\ttiny={}\tsmall_text={}", metric.private, metric.physical, metric.logical, format_size(metric.private), format_size(metric.physical), format_size(metric.logical), metric.files, metric.tiny, metric.small_text);
+            }
+            for id in ids {
+                print_artifact_record("PACKAGE_SCOPE", &root, &records, id);
+            }
+        }
+        "projects" => {
+            let mut ids = records.iter().enumerate().filter_map(|(id, record)| record.project_kind.map(|_| id as u32)).collect::<Vec<_>>();
+            artifact_non_overlapping(&records, &mut ids);
+            ids.sort_unstable_by(|a, b| records[*b as usize].total.private.cmp(&records[*a as usize].total.private));
+            println!("PROJECT_SUMMARY\tcount={}\toverlap=false", ids.len());
+            for id in ids { print_artifact_record("PROJECT", &root, &records, id); }
+        }
+        _ => panic!("unknown artifact query: {mode}"),
+    }
+}
+
 fn main() {
-    let mut arguments = env::args_os().skip(1);
-    let root = PathBuf::from(arguments.next().expect("usage: disk-scout ROOT [auto|max-throughput|THREADS]"));
-    let worker_argument = arguments.next();
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().and_then(|value| value.to_str()) == Some("query") {
+        query_artifact(&arguments[1..]);
+        return;
+    }
+    let root = PathBuf::from(arguments.first().expect("usage: disk-scout ROOT [auto|max-throughput|THREADS] [--artifact PATH]"));
+    let worker_argument = arguments.get(1).cloned();
+    let artifact_path = arguments.windows(2).find_map(|window| {
+        (window[0].to_str() == Some("--artifact")).then(|| PathBuf::from(&window[1]))
+    }).or_else(|| arguments.iter().find_map(|value| value.to_str().and_then(|text| text.strip_prefix("--artifact=")).map(PathBuf::from)));
     let worker_mode = worker_argument
         .as_ref()
         .and_then(|value| value.to_str())
@@ -1980,6 +2470,20 @@ fn main() {
         keep_top(&mut tiny_top, record.total.tiny, id);
         keep_top(&mut small_text_top, record.total.small_text, id);
         keep_top(&mut slack_top, record.total.physical.saturating_sub(record.total.logical), id);
+    }
+
+    if let Some(path) = artifact_path.as_ref() {
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                eprintln!("ERROR\tunable to create artifact parent {}: {error}", parent.display());
+                std::process::exit(2);
+            }
+        }
+        if let Err(error) = write_artifact(path, &root, &state.records) {
+            eprintln!("ERROR\tunable to write artifact {}: {error}", path.display());
+            std::process::exit(2);
+        }
+        println!("ARTIFACT\tpath={}\tformat=directory-index-v{}\tdirectories={}\toverlap_safe=true", escape_path(path), ARTIFACT_VERSION, state.records.len());
     }
 
     println!(

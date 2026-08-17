@@ -202,6 +202,24 @@ skills/reclaim-disk-space/scripts/incremental-disk-scout.sh \
 
 The first run records an FSEvents starting point. Later runs reuse the report when nothing changed or print dirty paths for targeted rescans. A dirty or stale cache is never presented as current.
 
+## Scan once, investigate instantly
+
+For a large audit, persist the directory index during the scan. It stores one compact record per directory—not one record per file—so agents can investigate paths, environments, package stores, projects, and disjoint storage branches without walking the filesystem again:
+
+```sh
+make artifact ROOT="$HOME" ARTIFACT=/tmp/reclaim-disk-space-artifact
+
+# These commands read the saved index; they do not rescan the filesystem.
+make query INDEX=/tmp/reclaim-disk-space-artifact/index.bin QUERY=summary
+make query INDEX=/tmp/reclaim-disk-space-artifact/index.bin QUERY=independent
+make query INDEX=/tmp/reclaim-disk-space-artifact/index.bin QUERY=environments
+make query INDEX=/tmp/reclaim-disk-space-artifact/index.bin QUERY=packages
+make query INDEX=/tmp/reclaim-disk-space-artifact/index.bin QUERY=projects
+make query INDEX=/tmp/reclaim-disk-space-artifact/index.bin QUERY=path TARGET="$HOME/Library"
+```
+
+The incremental helper writes the same `index.bin` beside its cached report. `environments` reports every discovered Python, Conda, and UV environment plus grouped totals; `packages` reports non-overlapping package scopes with explicit `scope_kind` labels and grouped `PACKAGE_TOTAL` rows for Conda, Python, JavaScript, Rust, JVM, Go, .NET, Ruby/PHP, and package-manager caches. `independent` partitions the directory tree before ranking, so parent and child totals are never presented as additive cleanup candidates.
+
 ## Limitations worth knowing
 
 - macOS privacy controls and Full Disk Access can hide protected Mail, Messages, Photos, and application data.

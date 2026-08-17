@@ -5,9 +5,13 @@ SCRIPTS := $(SKILL_DIR)/scripts
 ROOT ?= $(HOME)/Library
 PROFILE ?= auto
 OUT ?= /tmp/reclaim-disk-space.tsv
+ARTIFACT ?= /tmp/reclaim-disk-space-artifact
+INDEX ?= $(ARTIFACT)/index.bin
+QUERY ?= summary
+TARGET ?=
 CONFIRM ?=
 
-.PHONY: build test scan plan delete profile clean
+.PHONY: build test scan artifact query plan delete profile clean
 
 build:
 	$(SCRIPTS)/build-disk-scout.sh
@@ -24,6 +28,14 @@ test: build
 scan: build
 	$(SCRIPTS)/run-disk-scout.sh "$(ROOT)" "$(PROFILE)" > "$(OUT)"
 	@echo "Wrote $(OUT)"
+
+artifact: build
+	mkdir -p "$(ARTIFACT)"
+	$(SCRIPTS)/run-disk-scout.sh "$(ROOT)" "$(PROFILE)" --artifact "$(INDEX)" > "$(ARTIFACT)/report.tsv"
+	@echo "Wrote $(ARTIFACT)/report.tsv and $(INDEX)"
+
+query: build
+	$(SCRIPTS)/run-disk-scout.sh query "$(INDEX)" "$(QUERY)" $(if $(TARGET),"$(TARGET)",)
 
 plan: build
 	$(SCRIPTS)/run-disk-clean.sh --root "$(ROOT)"

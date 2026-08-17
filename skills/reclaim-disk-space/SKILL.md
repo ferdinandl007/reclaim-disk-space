@@ -66,18 +66,35 @@ Interpret output as follows:
 - `timestamp_queries`: how many entries required an exact native timestamp lookup; a much smaller number than total entries is expected in the fast path.
 - `native_directories`, `fallback_directories`, and `partial_directories`: backend and completeness telemetry. A nonzero `partial_directories` or `permission_errors` makes the scanner exit nonzero unless `DISK_SCOUT_ALLOW_INCOMPLETE=1` is explicitly set.
 - `CATEGORY`: optional path and format-based interpretation for stores whose extensions alone are ambiguous.
-- `ENVIRONMENT`: every detected standard or marker-confirmed Python environment (`.venv`, `venv`, `virtualenv`, `.python`, or a directory containing `pyvenv.cfg`) plus Conda environments under Conda `envs` roots or containing `conda-meta`, with independent totals, newest modified epoch, age, and a `stale_review` hint. This is an inventory signal, not deletion authority.
+- `ENVIRONMENT`: every detected standard or marker-confirmed Python environment (`.venv`, `venv`, `virtualenv`, `.python`, or a directory containing `pyvenv.cfg`), UV-backed `.venv`, plus Conda environments under Conda `envs` roots or containing `conda-meta`, with independent totals, newest modified epoch, age, and a `stale_review` hint. This is an inventory signal, not deletion authority.
 - `PROJECT`: detected Python, JavaScript, Rust, Go, iOS, Docker, JVM, and related project roots, with source/generated file totals, source activity age, Git ref activity when a `.git` directory is present, repository overlap, and a stale-review hint. `activity_basis` keeps source and Git evidence explicit; generated activity never counts as source freshness. `stale_review=review` means old source plus recent Git metadata and requires human review. A project is never automatically selected for deletion.
 - `GIT_REPOSITORY`: bounded, read-only Git metadata for detected repositories: branch/HEAD, resolved HEAD object when safe, common object-store directory, ref and index mtimes, worktree/remote/submodule counts, and `worktree_state`. `worktree_state=unknown` is intentional until index comparison proves cleanliness; `in_progress` is a safety stop for merge/rebase/cherry-pick markers. No Git subprocesses or hooks are executed.
 - `EVIDENCE_SUMMARY`: total versus reported record counts, including any bounded-report truncation.
 - `VERSION_CLUSTER` and `VERSION_MEMBER`: conservative same-directory families such as `photo.jpg`, `photo v2.jpg`, `photo (3).jpg`, or exported app variants. They combine filename normalization, size similarity, and creation/modified-date proximity; `evidence_quality` exposes which signals were actually available, and `suggested_keep` is only a review starting point.
-- `TOP_*`: overlapping directory rankings. Select independent branches before summing.
+- `TOP_*`: diagnostic rankings that may overlap. For additive cleanup candidates, use the persisted artifact `independent` query, which partitions the tree and guarantees `overlap=false`.
 - `ERROR_PATH`: permission or per-entry failures with a reason. State blind spots rather than claiming full attribution.
 - `HARDLINK_SUMMARY`: duplicate accounting telemetry. The current fast path attributes shared inode bytes to the first observed path; reports mark that attribution as nondeterministic rather than pretending it is canonical.
 
 Machine-readable fields use TSV escaping: literal tabs, newlines, carriage returns, and backslashes are emitted as `\\t`, `\\n`, `\\r`, and `\\\\`. Agents should decode those sequences before displaying paths.
 
 The incremental helper invalidates its cached report when the scanner binary or report schema changes; a clean filesystem event stream alone is not enough to reuse an old report. It also takes an atomic cache lock and reports `CACHE_STATUS busy` rather than allowing concurrent writers to corrupt the cache.
+
+## Persisted artifact and instant investigation
+
+Add `--artifact /exact/path/index.bin` to a scan to persist a compact directory index. The index stores parent links, direct and recursive APFS metrics, file-count pressure, context, environment and project markers, and is written atomically. It contains one record per directory and never one record per file.
+
+Query it without touching the filesystem:
+
+```sh
+scripts/run-disk-scout.sh query /exact/path/index.bin summary
+scripts/run-disk-scout.sh query /exact/path/index.bin independent private 50
+scripts/run-disk-scout.sh query /exact/path/index.bin environments
+scripts/run-disk-scout.sh query /exact/path/index.bin packages
+scripts/run-disk-scout.sh query /exact/path/index.bin projects
+scripts/run-disk-scout.sh query /exact/path/index.bin path /exact/path/to/investigate
+```
+
+`environments` lists every discovered Python, Conda, and UV environment and emits grouped totals. `packages` emits non-overlapping Conda package, Python `site-packages`, language dependency, and package-cache scopes, with a `scope_kind` on each row and grouped `PACKAGE_TOTAL` rows for fast agent aggregation. `path` returns one directory plus its immediate children. `independent` uses a best-first tree partition so no selected path is an ancestor of another selected path. The incremental helper stores this index beside `report.tsv` and reuses both when FSEvents is clean; dirty history fails closed and requests a targeted/full refresh rather than silently presenting stale data.
 
 ## Investigation priorities
 
