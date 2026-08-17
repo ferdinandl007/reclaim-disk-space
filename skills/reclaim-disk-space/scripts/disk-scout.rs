@@ -263,6 +263,7 @@ struct VersionCluster {
     suggested_keep: usize,
     created_span_days: u64,
     modified_span_days: u64,
+    evidence_quality: &'static str,
 }
 
 struct HardlinkSet {
@@ -862,26 +863,39 @@ fn finalize_version_groups(groups: HashMap<String, Vec<VersionCandidate>>) -> (V
     for (key, mut members) in groups {
         if members.len() < 2 || !members.iter().any(|member| member.has_version_signal) { continue; }
         members.sort_unstable_by(|a, b| b.modified_seconds.cmp(&a.modified_seconds).then_with(|| b.version_rank.cmp(&a.version_rank)).then_with(|| b.private.cmp(&a.private)));
-        let max_size = members.iter().map(|member| member.logical.max(member.physical)).max().unwrap_or(0);
-        let min_size = members.iter().map(|member| member.logical.max(member.physical)).min().unwrap_or(0);
-        let size_similarity = if max_size == 0 { 1.0 } else { min_size as f64 / max_size as f64 };
+        let sizes: Vec<u64> = members.iter().map(|member| member.logical.max(member.physical)).filter(|value| *value > 0).collect();
+        let size_evidence = sizes.len() >= 2;
+        let max_size = sizes.iter().copied().max().unwrap_or(0);
+        let min_size = sizes.iter().copied().min().unwrap_or(0);
+        let size_similarity = if !size_evidence { 0.0 } else { min_size as f64 / max_size as f64 };
         let created: Vec<u64> = members.iter().map(|member| member.created_seconds).filter(|value| *value > 0).collect();
         let modified: Vec<u64> = members.iter().map(|member| member.modified_seconds).filter(|value| *value > 0).collect();
         let created_span_days = created.iter().min().zip(created.iter().max()).map(|(min, max)| max.abs_diff(*min) / 86_400).unwrap_or(0);
         let modified_span_days = modified.iter().min().zip(modified.iter().max()).map(|(min, max)| max.abs_diff(*min) / 86_400).unwrap_or(0);
-        let close_in_time = created_span_days <= 30 || modified_span_days <= 30;
+        let close_in_time = (created.len() >= 2 && created_span_days <= 30) || (modified.len() >= 2 && modified_span_days <= 30);
         let signal_count = members.iter().filter(|member| member.has_version_signal).count();
         let confidence = if signal_count >= 2 && (size_similarity >= 0.70 || close_in_time) { "high" }
             else if size_similarity >= 0.45 || close_in_time { "medium" }
+            else if signal_count >= 1 { "low" }
             else { continue };
+        let evidence_quality = match (size_evidence, created.len() >= 2, modified.len() >= 2) {
+            (true, true, true) => "name+size+created+modified",
+            (true, true, false) => "name+size+created",
+            (true, false, true) => "name+size+modified",
+            (true, false, false) => "name+size",
+            (false, true, true) => "name+created+modified",
+            (false, true, false) => "name+created",
+            (false, false, true) => "name+modified",
+            (false, false, false) => "name_only",
+        };
         let mut reasons = Vec::new();
         if signal_count > 0 { reasons.push("name_variant"); }
-        if size_similarity >= 0.70 { reasons.push("size_similarity"); }
+        if size_evidence && size_similarity >= 0.70 { reasons.push("size_similarity"); }
         if close_in_time { reasons.push("creation_or_modified_date"); }
         let suggested_keep = 0usize;
         let review_reclaim_private = members.iter().enumerate().filter(|(index, _)| *index != suggested_keep).map(|(_, member)| member.private).sum();
         let review_reclaim_physical = members.iter().enumerate().filter(|(index, _)| *index != suggested_keep).map(|(_, member)| member.physical).sum();
-        clusters.push(VersionCluster { key, members, confidence, reason: reasons.join("+"), review_reclaim_private, review_reclaim_physical, suggested_keep, created_span_days, modified_span_days });
+        clusters.push(VersionCluster { key, members, confidence, reason: reasons.join("+"), review_reclaim_private, review_reclaim_physical, suggested_keep, created_span_days, modified_span_days, evidence_quality });
     }
     let count = clusters.len() as u64;
     clusters.sort_unstable_by(|a, b| b.review_reclaim_private.cmp(&a.review_reclaim_private).then_with(|| b.review_reclaim_physical.cmp(&a.review_reclaim_physical)));
@@ -1651,8 +1665,11 @@ fn main() {
         let age_label = age_days.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string());
         let stale = age_days.map(|value| value >= STALE_REVIEW_DAYS).unwrap_or(false);
         println!(
-            "ENVIRONMENT\tkind={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\ttiny={}\tsmall_text={}\tnewest_modified_epoch={}\tage_days={}\tstale_review={}\tpath={}",
+            "ENVIRONMENT\tkind={}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\ttiny={}\tsmall_text={}\tnewest_modified_epoch={}\tage_days={}\tstale_review={}\tpath={}",
             record.environment_kind.unwrap_or("unknown"),
+            record.total.private,
+            record.total.physical,
+            record.total.logical,
             format_size(record.total.private),
             format_size(record.total.physical),
             format_size(record.total.logical),
@@ -1670,6 +1687,15 @@ fn main() {
         .filter_map(|(id, record)| record.project_kind.map(|_| id as u32))
         .collect();
     project_ids.sort_unstable_by(|a, b| state.records[*b as usize].total.private.cmp(&state.records[*a as usize].total.private));
+    println!(
+        "EVIDENCE_SUMMARY\tenvironments_total={}\tenvironments_reported={}\tprojects_total={}\tprojects_reported={}\tversion_clusters_total={}\tversion_clusters_reported={}",
+        state.records.iter().filter(|record| record.environment_kind.is_some()).count(),
+        state.records.iter().filter(|record| record.environment_kind.is_some()).take(ENVIRONMENT_TOP_K).count(),
+        state.records.iter().filter(|record| record.project_kind.is_some()).count(),
+        state.records.iter().filter(|record| record.project_kind.is_some()).take(PROJECT_TOP_K).count(),
+        state.version_cluster_count,
+        state.version_clusters.len(),
+    );
     for id in project_ids.into_iter().take(PROJECT_TOP_K) {
         let record = &state.records[id as usize];
         let newest = record.total.newest_modified_seconds;
@@ -1677,8 +1703,11 @@ fn main() {
         let age_label = age_days.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string());
         let stale = age_days.map(|value| value >= STALE_REVIEW_DAYS).unwrap_or(false);
         println!(
-            "PROJECT\tkind={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\tnewest_modified_epoch={}\tage_days={}\tstale_review={}\tpath={}",
+            "PROJECT\tkind={}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\tnewest_modified_epoch={}\tage_days={}\tstale_review={}\tpath={}",
             record.project_kind.unwrap_or("project"),
+            record.total.private,
+            record.total.physical,
+            record.total.logical,
             format_size(record.total.private),
             format_size(record.total.physical),
             format_size(record.total.logical),
@@ -1693,11 +1722,14 @@ fn main() {
     for (cluster_id, cluster) in state.version_clusters.iter().enumerate() {
         let suggested_keep = cluster.members.get(cluster.suggested_keep).map(|member| member.path.display().to_string()).unwrap_or_default();
         println!(
-            "VERSION_CLUSTER\tid={}\tkey={}\tconfidence={}\tmembers={}\treview_reclaim_private={}\treview_reclaim_allocated={}\tcreated_span_days={}\tmodified_span_days={}\treason={}\tsuggested_keep={}",
+            "VERSION_CLUSTER\tid={}\tkey={}\tconfidence={}\tevidence_quality={}\tmembers={}\treview_reclaim_private_bytes={}\treview_reclaim_allocated_bytes={}\treview_reclaim_private={}\treview_reclaim_allocated={}\tcreated_span_days={}\tmodified_span_days={}\treason={}\tsuggested_keep={}",
             cluster_id,
             cluster.key,
             cluster.confidence,
+            cluster.evidence_quality,
             cluster.members.len(),
+            cluster.review_reclaim_private,
+            cluster.review_reclaim_physical,
             format_size(cluster.review_reclaim_private),
             format_size(cluster.review_reclaim_physical),
             cluster.created_span_days,
@@ -1707,12 +1739,15 @@ fn main() {
         );
         for (member_id, member) in cluster.members.iter().enumerate() {
             println!(
-                "VERSION_MEMBER\tcluster_id={}\tmember_id={}\tversion_rank={}\tcreated_epoch={}\tmodified_epoch={}\tprivate={}\tallocated={}\tlogical={}\tpath={}",
+                "VERSION_MEMBER\tcluster_id={}\tmember_id={}\tversion_rank={}\tcreated_epoch={}\tmodified_epoch={}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tpath={}",
                 cluster_id,
                 member_id,
                 member.version_rank,
                 member.created_seconds,
                 member.modified_seconds,
+                member.private,
+                member.physical,
+                member.logical,
                 format_size(member.private),
                 format_size(member.physical),
                 format_size(member.logical),

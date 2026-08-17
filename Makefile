@@ -7,12 +7,15 @@ PROFILE ?= auto
 OUT ?= /tmp/reclaim-disk-space.tsv
 CONFIRM ?=
 
-.PHONY: build scan plan delete clean
+.PHONY: build test scan plan delete clean
 
 build:
 	$(SCRIPTS)/build-disk-scout.sh
 	$(SCRIPTS)/build-disk-clean.sh
 	$(SCRIPTS)/build-fsevents-since.sh
+
+test: build
+	./scripts/test-safety.sh
 
 scan: build
 	$(SCRIPTS)/run-disk-scout.sh "$(ROOT)" "$(PROFILE)" > "$(OUT)"

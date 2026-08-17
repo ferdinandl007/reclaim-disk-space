@@ -109,6 +109,9 @@ fn parse_args() -> Config {
 }
 
 fn canonical_directory(value: &Path) -> io::Result<PathBuf> {
+    if !value.is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "root must be absolute"));
+    }
     let metadata = fs::symlink_metadata(value)?;
     if metadata.file_type().is_symlink() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "root may not be a symlink"));

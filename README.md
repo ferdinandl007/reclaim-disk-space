@@ -138,7 +138,8 @@ EXTENSION name=sqlite       private=...
 ENVIRONMENT kind=python_venv private=... age_days=... stale_review=true path=/Users/.../project/.venv
 ENVIRONMENT kind=conda_env  private=... age_days=... stale_review=true path=/Users/.../miniconda3/envs/old-ai
 PROJECT kind=rust_project  private=... age_days=... stale_review=false path=/Users/.../src/tool
-VERSION_CLUSTER key=photo.jpg confidence=high members=4 review_reclaim_private=... suggested_keep=...
+EVIDENCE_SUMMARY environments_total=... projects_total=... version_clusters_total=...
+VERSION_CLUSTER key=photo.jpg confidence=high evidence_quality=name+size+created+modified members=4 review_reclaim_private=... suggested_keep=...
 VERSION_MEMBER cluster_id=0 version_rank=3 modified_epoch=... path=/Users/.../photo v3.jpg
 
 TOP_PRIVATE       path=/Users/.../Library/Developer/CoreSimulator
@@ -170,6 +171,7 @@ Requirements: Apple Command Line Tools (`clang`), Rust (`rustc`), and an Apple S
 
 ```sh
 make build
+make test
 make scan ROOT="$HOME/Library" OUT=/tmp/library-storage.tsv
 make plan ROOT="$HOME/Library/Developer/Xcode/DerivedData"
 ```

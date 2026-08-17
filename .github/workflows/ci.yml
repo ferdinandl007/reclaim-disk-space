@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build native tools
-        run: make build
+        run: make test
 
       - name: Smoke-test release bundle
         run: ./scripts/build-release.sh "$RUNNER_TEMP/dist" ci

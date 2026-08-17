@@ -66,7 +66,8 @@ Interpret output as follows:
 - `CATEGORY`: optional path and format-based interpretation for stores whose extensions alone are ambiguous.
 - `ENVIRONMENT`: every detected standard or marker-confirmed Python environment (`.venv`, `venv`, `virtualenv`, `.python`, or a directory containing `pyvenv.cfg`) plus Conda environments under Conda `envs` roots or containing `conda-meta`, with independent totals, newest modified epoch, age, and a `stale_review` hint. This is an inventory signal, not deletion authority.
 - `PROJECT`: detected Python, JavaScript, Rust, Go, iOS, Docker, JVM, and related project roots, with independent totals and an age-based stale-review hint. A project is never automatically selected for deletion.
-- `VERSION_CLUSTER` and `VERSION_MEMBER`: conservative same-directory families such as `photo.jpg`, `photo v2.jpg`, `photo (3).jpg`, or exported app variants. They combine filename normalization, size similarity, and creation/modified-date proximity; `suggested_keep` is only a review starting point.
+- `EVIDENCE_SUMMARY`: total versus reported record counts, including any bounded-report truncation.
+- `VERSION_CLUSTER` and `VERSION_MEMBER`: conservative same-directory families such as `photo.jpg`, `photo v2.jpg`, `photo (3).jpg`, or exported app variants. They combine filename normalization, size similarity, and creation/modified-date proximity; `evidence_quality` exposes which signals were actually available, and `suggested_keep` is only a review starting point.
 - `TOP_*`: overlapping directory rankings. Select independent branches before summing.
 - `ERROR_PATH`: permission or per-entry failures. State blind spots rather than claiming full attribution.
 
