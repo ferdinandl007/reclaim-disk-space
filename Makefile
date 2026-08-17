@@ -16,6 +16,9 @@ build:
 
 test: build
 	./scripts/test-safety.sh
+	./scripts/test-release.sh
+	./scripts/test-cleaner.sh
+	./scripts/test-incremental.sh
 	./scripts/test-scout.sh
 
 scan: build

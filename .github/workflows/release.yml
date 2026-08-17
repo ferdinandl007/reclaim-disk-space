@@ -14,6 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Run full validation suite
+        run: make test
+
       - name: Build arm64 release bundle
         run: |
           set -eu

@@ -1,11 +1,11 @@
-use std::cmp::Reverse;
 use std::env;
 use std::ffi::CString;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Write};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,13 +17,43 @@ const ERROR_SAMPLE_LIMIT: usize = 100;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(750);
 const TUNE_WINDOW: Duration = Duration::from_secs(4);
 
+fn escape_tsv(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\\' => escaped.push_str("\\\\"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped.chars().take(2000).collect()
+}
+
+fn escape_path(path: &Path) -> String {
+    escape_tsv(&path.to_string_lossy())
+}
+
 extern "C" {
+    fn ds_open_directory_fd(path: *const c_char) -> RawFd;
+    fn ds_unlink_relative(root_fd: RawFd, relative: *const c_char, expected_device: u64, expected_inode: u64, expected_mode: u32) -> i32;
+    fn ds_remove_directory_relative(root_fd: RawFd, relative: *const c_char, expected_device: u64, expected_inode: u64, expected_mode: u32) -> i32;
+    fn ds_close_fd(fd: RawFd);
     fn ds_recommended_worker_limit() -> usize;
     fn ds_free_bytes(path: *const c_char) -> u64;
     fn ds_logical_cpu_count() -> u32;
     fn ds_process_cpu_seconds() -> f64;
     fn ds_host_cpu_busy_fraction() -> f64;
     fn ds_set_interactive_priority() -> i32;
+}
+
+#[derive(Clone)]
+struct DeleteTarget {
+    relative: PathBuf,
+    device: u64,
+    inode: u64,
+    mode: u32,
 }
 
 struct Config {
@@ -35,26 +65,119 @@ struct Config {
     max_throughput: bool,
 }
 
-#[derive(Default)]
 struct Inventory {
-    nodes: Vec<PathBuf>,
-    directories: Vec<PathBuf>,
+    node_spool: PathBuf,
+    nodes: u64,
+    directories: u64,
+    root: DeleteTarget,
     logical_bytes: u64,
     allocated_bytes: u64,
     scan_errors: Vec<String>,
     mounts_skipped: usize,
 }
 
+const NODE_BATCH_SIZE: usize = 8192;
+
+fn spool_path() -> PathBuf {
+    env::temp_dir().join(format!("reclaim-disk-space-nodes-{}.bin", std::process::id()))
+}
+
+fn write_target(file: &mut File, target: &DeleteTarget) -> io::Result<()> {
+    let bytes = target.relative.as_os_str().as_bytes();
+    let length = u32::try_from(bytes.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path too long"))?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(bytes)?;
+    file.write_all(&target.device.to_le_bytes())?;
+    file.write_all(&target.inode.to_le_bytes())?;
+    file.write_all(&target.mode.to_le_bytes())
+}
+
+fn read_target(reader: &mut BufReader<File>) -> io::Result<Option<DeleteTarget>> {
+    let mut length_bytes = [0u8; 4];
+    match reader.read_exact(&mut length_bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    if length > 1024 * 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "spooled path is unreasonably long"));
+    }
+    let mut path_bytes = vec![0u8; length];
+    reader.read_exact(&mut path_bytes)?;
+    let mut device_bytes = [0u8; 8];
+    let mut inode_bytes = [0u8; 8];
+    let mut mode_bytes = [0u8; 4];
+    reader.read_exact(&mut device_bytes)?;
+    reader.read_exact(&mut inode_bytes)?;
+    reader.read_exact(&mut mode_bytes)?;
+    Ok(Some(DeleteTarget {
+        relative: PathBuf::from(std::ffi::OsStr::from_bytes(&path_bytes)),
+        device: u64::from_le_bytes(device_bytes),
+        inode: u64::from_le_bytes(inode_bytes),
+        mode: u32::from_le_bytes(mode_bytes),
+    }))
+}
+
+fn read_target_batch(reader: &mut BufReader<File>, maximum: usize) -> io::Result<Vec<DeleteTarget>> {
+    let mut batch = Vec::with_capacity(maximum.min(NODE_BATCH_SIZE));
+    while batch.len() < maximum {
+        match read_target(reader)? {
+            Some(target) => batch.push(target),
+            None => break,
+        }
+    }
+    Ok(batch)
+}
+
 #[derive(Default)]
 struct DeleteStats {
     next: AtomicUsize,
     completed: AtomicUsize,
+    attempted: AtomicUsize,
+    deleted: AtomicUsize,
+    not_found: AtomicUsize,
     errors: AtomicUsize,
     op_nanos: AtomicU64,
     target_workers: AtomicUsize,
     workers_peak: AtomicUsize,
     stop: AtomicBool,
     samples: Mutex<Vec<String>>,
+}
+
+#[derive(Default)]
+struct DeleteTotals {
+    attempted: usize,
+    deleted: usize,
+    not_found: usize,
+    errors: usize,
+    op_nanos: u64,
+    workers_peak: usize,
+    samples: Vec<String>,
+}
+
+impl DeleteTotals {
+    fn absorb(&mut self, stats: DeleteStats) {
+        self.attempted += stats.attempted.load(Ordering::Relaxed);
+        self.deleted += stats.deleted.load(Ordering::Relaxed);
+        self.not_found += stats.not_found.load(Ordering::Relaxed);
+        self.errors += stats.errors.load(Ordering::Relaxed);
+        self.op_nanos = self.op_nanos.saturating_add(stats.op_nanos.load(Ordering::Relaxed));
+        self.workers_peak = self.workers_peak.max(stats.workers_peak.load(Ordering::Relaxed));
+        let samples = stats.samples.into_inner().unwrap_or_default();
+        for sample in samples {
+            if self.samples.len() < ERROR_SAMPLE_LIMIT {
+                self.samples.push(sample);
+            }
+        }
+    }
+
+    fn record_error(&mut self, target: &Path, error: &io::Error) {
+        self.errors += 1;
+        if self.samples.len() < ERROR_SAMPLE_LIMIT {
+            self.samples.push(format!("{}: {error}", escape_path(target)));
+        }
+    }
 }
 
 fn usage() -> ! {
@@ -181,15 +304,26 @@ fn metadata_retry(target: &Path) -> io::Result<fs::Metadata> {
 fn inventory(root: &Path) -> io::Result<Inventory> {
     let root_metadata = fs::symlink_metadata(root)?;
     let root_device = root_metadata.dev();
-    let mut result = Inventory::default();
-    let mut pending = vec![root.to_path_buf()];
-    result.directories.push(root.to_path_buf());
+    let root_target = DeleteTarget { relative: PathBuf::new(), device: root_metadata.dev(), inode: root_metadata.ino(), mode: root_metadata.mode() as u32 };
+    let node_spool = spool_path();
+    let mut spool = OpenOptions::new().write(true).create_new(true).open(&node_spool)?;
+    let mut result = Inventory {
+        node_spool,
+        nodes: 0,
+        directories: 1,
+        root: root_target.clone(),
+        logical_bytes: 0,
+        allocated_bytes: 0,
+        scan_errors: Vec::new(),
+        mounts_skipped: 0,
+    };
+    let mut pending = vec![(root.to_path_buf(), PathBuf::new())];
 
-    while let Some(directory) = pending.pop() {
+    while let Some((directory, relative_directory)) = pending.pop() {
         let mut entries = match read_directory_retry(&directory) {
             Ok(value) => value,
             Err(error) => {
-                result.scan_errors.push(format!("{}: {error}", directory.display()));
+                result.scan_errors.push(format!("{}: {error}", escape_path(&directory)));
                 continue;
             }
         };
@@ -198,15 +332,16 @@ fn inventory(root: &Path) -> io::Result<Inventory> {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
-                    result.scan_errors.push(format!("{}: {error}", directory.display()));
+                    result.scan_errors.push(format!("{}: {error}", escape_path(&directory)));
                     continue;
                 }
             };
             let child = entry.path();
+            let relative = relative_directory.join(entry.file_name());
             let metadata = match metadata_retry(&child) {
                 Ok(value) => value,
                 Err(error) => {
-                    result.scan_errors.push(format!("{}: {error}", child.display()));
+                    result.scan_errors.push(format!("{}: {error}", escape_path(&child)));
                     continue;
                 }
             };
@@ -215,17 +350,19 @@ fn inventory(root: &Path) -> io::Result<Inventory> {
                     result.mounts_skipped += 1;
                     continue;
                 }
-                result.directories.push(child.clone());
-                pending.push(child);
+                result.directories += 1;
+                pending.push((child, relative));
             } else {
                 result.logical_bytes = result.logical_bytes.saturating_add(metadata.size());
                 result.allocated_bytes = result
                     .allocated_bytes
                     .saturating_add(metadata.blocks().saturating_mul(512));
-                result.nodes.push(child);
+                write_target(&mut spool, &DeleteTarget { relative, device: metadata.dev(), inode: metadata.ino(), mode: metadata.mode() as u32 })?;
+                result.nodes += 1;
             }
         }
     }
+    spool.flush()?;
     Ok(result)
 }
 
@@ -233,25 +370,53 @@ fn record_error(stats: &DeleteStats, target: &Path, error: &io::Error) {
     stats.errors.fetch_add(1, Ordering::Relaxed);
     let mut samples = stats.samples.lock().unwrap();
     if samples.len() < ERROR_SAMPLE_LIMIT {
-        samples.push(format!("{}: {error}", target.display()));
+        samples.push(format!("{}: {error}", escape_path(target)));
     }
 }
 
-fn remove_node(target: &Path) -> io::Result<()> {
+fn remove_node(root_fd: RawFd, target: &DeleteTarget) -> io::Result<bool> {
+    let relative = CString::new(target.relative.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     for _ in 0..8 {
-        match fs::remove_file(target) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
+        let result = unsafe { ds_unlink_relative(root_fd, relative.as_ptr(), target.device, target.inode, target.mode) };
+        match result {
+            0 => return Ok(true),
+            -1 => match io::Error::last_os_error().kind() {
+                io::ErrorKind::NotFound => return Ok(false),
+                io::ErrorKind::Interrupted => continue,
+                _ => return Err(io::Error::last_os_error()),
+            },
+            _ => return Err(io::Error::new(io::ErrorKind::Other, "unexpected unlink result")),
         }
     }
     Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted repeatedly"))
 }
 
-fn remove_directory(target: &Path) -> io::Result<()> {
+fn remove_directory_relative(root_fd: RawFd, target: &DeleteTarget) -> io::Result<()> {
+    let relative = CString::new(target.relative.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     for _ in 0..8 {
-        match fs::remove_dir(target) {
+        let result = unsafe { ds_remove_directory_relative(root_fd, relative.as_ptr(), target.device, target.inode, target.mode) };
+        match result {
+            0 => return Ok(()),
+            -1 => match io::Error::last_os_error().kind() {
+                io::ErrorKind::NotFound => return Ok(()),
+                io::ErrorKind::Interrupted => continue,
+                _ => return Err(io::Error::last_os_error()),
+            },
+            _ => return Err(io::Error::new(io::ErrorKind::Other, "unexpected rmdir result")),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted repeatedly"))
+}
+
+fn remove_root_directory(root: &Path, target: &DeleteTarget) -> io::Result<()> {
+    let metadata = metadata_retry(root)?;
+    if metadata.dev() != target.device || metadata.ino() != target.inode || metadata.mode() as u32 & 0o170000 != target.mode & 0o170000 {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, "root changed during cleanup"));
+    }
+    for _ in 0..8 {
+        match fs::remove_dir(root) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -263,7 +428,8 @@ fn remove_directory(target: &Path) -> io::Result<()> {
 
 fn spawn_worker(
     worker_id: usize,
-    nodes: Arc<Vec<PathBuf>>,
+    root_fd: RawFd,
+    nodes: Arc<Vec<DeleteTarget>>,
     stats: Arc<DeleteStats>,
 ) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
@@ -279,8 +445,13 @@ fn spawn_worker(
                     break;
                 }
                 let started = Instant::now();
-                if let Err(error) = remove_node(&nodes[index]) {
-                    record_error(&stats, &nodes[index], &error);
+                stats.attempted.fetch_add(1, Ordering::Relaxed);
+                match remove_node(root_fd, &nodes[index]) {
+                    Ok(true) => { stats.deleted.fetch_add(1, Ordering::Relaxed); }
+                    Ok(false) => { stats.not_found.fetch_add(1, Ordering::Relaxed); }
+                    Err(error) => {
+                        record_error(&stats, &nodes[index].relative, &error);
+                    }
                 }
                 stats.op_nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 stats.completed.fetch_add(1, Ordering::Release);
@@ -293,14 +464,14 @@ fn free_bytes(root: &Path) -> u64 {
     unsafe { ds_free_bytes(value.as_ptr() as *const c_char) }
 }
 
-fn delete_nodes(root: &Path, nodes: Vec<PathBuf>, maximum: usize, interactive: bool, logical_cpus: u32) -> DeleteStats {
+fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: usize, interactive: bool, logical_cpus: u32) -> DeleteStats {
     let nodes = Arc::new(nodes);
     let stats = Arc::new(DeleteStats::default());
     let initial = maximum.min(2).max(1);
     stats.target_workers.store(initial, Ordering::Relaxed);
     let mut workers = Vec::new();
     for worker_id in 0..initial {
-        workers.push(spawn_worker(worker_id, nodes.clone(), stats.clone()).expect("worker spawn failed"));
+        workers.push(spawn_worker(worker_id, root_fd, nodes.clone(), stats.clone()).expect("worker spawn failed"));
     }
     stats.workers_peak.store(workers.len(), Ordering::Relaxed);
 
@@ -398,7 +569,7 @@ fn delete_nodes(root: &Path, nodes: Vec<PathBuf>, maximum: usize, interactive: b
 
         while workers.len() < target {
             let worker_id = workers.len();
-            match spawn_worker(worker_id, nodes.clone(), stats.clone()) {
+            match spawn_worker(worker_id, root_fd, nodes.clone(), stats.clone()) {
                 Ok(worker) => workers.push(worker),
                 Err(_) => {
                     target = workers.len().max(1);
@@ -409,8 +580,8 @@ fn delete_nodes(root: &Path, nodes: Vec<PathBuf>, maximum: usize, interactive: b
         stats.workers_peak.fetch_max(workers.len(), Ordering::Relaxed);
         stats.target_workers.store(target.min(workers.len()).max(1), Ordering::Relaxed);
         eprintln!(
-            "PROGRESS\tdeleted={}\ttotal={}\trate={:.0}/s\tavg_ms={:.2}\tworkers={}\tspawned={}\tcpu_cores={:.2}\thost_busy={:.0}%\tfree={}\terrors={}\telapsed={:.1}s",
-            completed, nodes.len(), rate, average_ms, stats.target_workers.load(Ordering::Relaxed),
+            "PROGRESS\tprocessed={}\tdeleted={}\ttotal={}\trate={:.0}/s\tavg_ms={:.2}\tworkers={}\tspawned={}\tcpu_cores={:.2}\thost_busy={:.0}%\tfree={}\terrors={}\telapsed={:.1}s",
+            completed, stats.deleted.load(Ordering::Relaxed), nodes.len(), rate, average_ms, stats.target_workers.load(Ordering::Relaxed),
             workers.len(), cpu_cores, system_load * 100.0, format_size(available), errors, started.elapsed().as_secs_f64()
         );
         last = now;
@@ -422,33 +593,93 @@ fn delete_nodes(root: &Path, nodes: Vec<PathBuf>, maximum: usize, interactive: b
     Arc::try_unwrap(stats).unwrap_or_else(|_| panic!("worker state still shared"))
 }
 
+fn remove_empty_directories(root: &Path, root_fd: RawFd, root_device: u64, keep_root: bool, totals: &mut DeleteTotals) -> usize {
+    let mut pending = vec![(root.to_path_buf(), PathBuf::new(), false)];
+    let mut attempted = 0;
+    while let Some((directory, relative, visited)) = pending.pop() {
+        let metadata = match metadata_retry(&directory) {
+            Ok(value) => value,
+            Err(error) => {
+                totals.record_error(&directory, &error);
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.dev() != root_device {
+            continue;
+        }
+        let target = DeleteTarget { relative: relative.clone(), device: metadata.dev(), inode: metadata.ino(), mode: metadata.mode() as u32 };
+        if !visited {
+            pending.push((directory.clone(), relative.clone(), true));
+            let mut entries = match read_directory_retry(&directory) {
+                Ok(value) => value,
+                Err(error) => {
+                    totals.record_error(&directory, &error);
+                    continue;
+                }
+            };
+            while let Some(entry_result) = entries.next() {
+                let entry = match entry_result {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        totals.record_error(&directory, &error);
+                        continue;
+                    }
+                };
+                let child = entry.path();
+                let child_metadata = match metadata_retry(&child) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        totals.record_error(&child, &error);
+                        continue;
+                    }
+                };
+                if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() && child_metadata.dev() == root_device {
+                    pending.push((child, relative.join(entry.file_name()), false));
+                }
+            }
+        } else if !target.relative.as_os_str().is_empty() {
+            attempted += 1;
+            if let Err(error) = remove_directory_relative(root_fd, &target) {
+                totals.record_error(&directory, &error);
+            }
+        } else if !keep_root {
+            attempted += 1;
+            if let Err(error) = remove_root_directory(root, &target) {
+                totals.record_error(root, &error);
+            }
+        }
+    }
+    attempted
+}
+
 fn main() {
     let config = parse_args();
     let root = canonical_directory(&config.root).unwrap_or_else(|error| {
-        eprintln!("ERROR\troot={}\t{error}", config.root.display());
+        eprintln!("ERROR\troot={}\t{error}", escape_path(&config.root));
         std::process::exit(2);
     });
     validate_root(&root).unwrap_or_else(|error| {
-        eprintln!("ERROR\troot={}\t{error}", root.display());
+        eprintln!("ERROR\troot={}\t{error}", escape_path(&root));
         std::process::exit(2);
     });
     if !config.max_throughput { unsafe { ds_set_interactive_priority(); } }
     if config.execute {
         let confirmed = config.confirmation.as_deref().and_then(|value| value.canonicalize().ok());
         if confirmed.as_deref() != Some(root.as_path()) {
-            eprintln!("ERROR\t--execute requires --confirm matching canonical root: {}", root.display());
+            eprintln!("ERROR\t--execute requires --confirm matching canonical root: {}", escape_path(&root));
             std::process::exit(2);
         }
     }
 
-    eprintln!("ENUMERATING\troot={}", root.display());
-    let mut found = inventory(&root).unwrap_or_else(|error| {
-        eprintln!("ERROR\troot={}\t{error}", root.display());
+    eprintln!("ENUMERATING\troot={}", escape_path(&root));
+    let found = inventory(&root).unwrap_or_else(|error| {
+        eprintln!("ERROR\troot={}\t{error}", escape_path(&root));
         std::process::exit(1);
     });
     println!(
         "PLAN\troot={}\tnodes={}\tdirectories={}\tlogical={}\tallocated={}\tscan_errors={}\tmounts_skipped={}\tmode={}",
-        root.display(), found.nodes.len(), found.directories.len(), format_size(found.logical_bytes),
+        escape_path(&root), found.nodes, found.directories, format_size(found.logical_bytes),
         format_size(found.allocated_bytes), found.scan_errors.len(), found.mounts_skipped,
         if config.execute { "execute" } else { "dry-run" }
     );
@@ -456,6 +687,7 @@ fn main() {
         eprintln!("SCAN_ERROR\t{error}");
     }
     if !config.execute {
+        let _ = fs::remove_file(&found.node_spool);
         return;
     }
     if !found.scan_errors.is_empty() || found.mounts_skipped > 0 {
@@ -466,27 +698,47 @@ fn main() {
     let hardware_limit = unsafe { ds_recommended_worker_limit() }.clamp(1, ABSOLUTE_WORKER_CAP);
     let maximum = config.requested_workers.unwrap_or(hardware_limit).clamp(1, hardware_limit);
     let logical_cpus = unsafe { ds_logical_cpu_count() }.max(1);
-    let stats = delete_nodes(&root, std::mem::take(&mut found.nodes), maximum, !config.max_throughput, logical_cpus);
-
-    found.directories.sort_unstable_by_key(|value| Reverse((value.components().count(), value.as_os_str().len())));
-    let mut directory_errors = 0;
-    for directory in &found.directories {
-        if config.keep_root && directory == &root { continue; }
-        if let Err(error) = remove_directory(directory) {
-            directory_errors += 1;
-            record_error(&stats, directory, &error);
-        }
+    let root_c = CString::new(root.as_os_str().as_bytes()).unwrap_or_else(|_| {
+        eprintln!("ERROR\troot path contains NUL");
+        std::process::exit(2);
+    });
+    let root_fd = unsafe { ds_open_directory_fd(root_c.as_ptr()) };
+    if root_fd < 0 {
+        eprintln!("ERROR\tunable to open cleanup root safely: {}", io::Error::last_os_error());
+        std::process::exit(1);
     }
-    let total_errors = stats.errors.load(Ordering::Relaxed);
+    let mut totals = DeleteTotals::default();
+    let spool_file = File::open(&found.node_spool).unwrap_or_else(|error| {
+        eprintln!("ERROR\tunable to open cleanup spool: {error}");
+        unsafe { ds_close_fd(root_fd); }
+        std::process::exit(1);
+    });
+    let mut spool_reader = BufReader::new(spool_file);
+    loop {
+        let batch = read_target_batch(&mut spool_reader, NODE_BATCH_SIZE).unwrap_or_else(|error| {
+            eprintln!("ERROR\tunable to read cleanup spool: {error}");
+            unsafe { ds_close_fd(root_fd); }
+            std::process::exit(1);
+        });
+        if batch.is_empty() { break; }
+        totals.absorb(delete_nodes(&root, root_fd, batch, maximum, !config.max_throughput, logical_cpus));
+    }
+    drop(spool_reader);
+    let _ = fs::remove_file(&found.node_spool);
+
+    let errors_before_directories = totals.errors;
+    let directories_attempted = remove_empty_directories(&root, root_fd, found.root.device, config.keep_root, &mut totals);
+    let directory_errors = totals.errors.saturating_sub(errors_before_directories);
+    unsafe { ds_close_fd(root_fd); }
     println!(
-        "SUMMARY\troot={}\tnodes_deleted={}\tdirectories_attempted={}\terrors={}\tdirectory_errors={}\tprofile={}\tlogical_cpus={}\tworkers_peak={}\tworker_ceiling={}\tfree={}",
-        root.display(), stats.completed.load(Ordering::Relaxed), found.directories.len(), total_errors,
+        "SUMMARY\troot={}\tnodes_attempted={}\tnodes_deleted={}\tnodes_not_found={}\tdirectories_attempted={}\terrors={}\tdirectory_errors={}\tprofile={}\tlogical_cpus={}\tworkers_peak={}\tworker_ceiling={}\tfree={}",
+        escape_path(&root), totals.attempted, totals.deleted, totals.not_found, directories_attempted, totals.errors,
         directory_errors, if config.max_throughput { "max-throughput" } else { "interactive" }, logical_cpus,
-        stats.workers_peak.load(Ordering::Relaxed), maximum,
+        totals.workers_peak, maximum,
         format_size(free_bytes(root.parent().unwrap_or(Path::new("/"))))
     );
-    for error in stats.samples.into_inner().unwrap() {
+    for error in totals.samples {
         eprintln!("DELETE_ERROR\t{error}");
     }
-    if total_errors > 0 { std::process::exit(1); }
+    if totals.errors > 0 { std::process::exit(1); }
 }

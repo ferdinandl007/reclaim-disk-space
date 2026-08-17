@@ -138,8 +138,9 @@ EXTENSION name=sqlite       private=...
 ENVIRONMENT kind=python_venv private=... age_days=... stale_review=true path=/Users/.../project/.venv
 ENVIRONMENT kind=conda_env  private=... age_days=... stale_review=true path=/Users/.../miniconda3/envs/old-ai
 PROJECT kind=rust_project  private=... age_days=... stale_review=false path=/Users/.../src/tool
-PROJECT kind=python_project source_files=... generated_files=... source_age_days=... stale_review=unknown path=/Users/.../project
-EVIDENCE_SUMMARY environments_total=... projects_total=... version_clusters_total=...
+PROJECT kind=python_project git_repo=true repository_root=/Users/.../repo project_overlap=true git_branch=main source_files=... generated_files=... source_age_days=... activity_age_days=... stale_review=unknown path=/Users/.../project
+GIT_REPOSITORY root=/Users/.../repo branch=main head_oid=... worktree_state=unknown ref_activity_epoch=... index_modified_epoch=... worktree_count=... remote_count=... submodule_count=... metadata_bytes=...
+EVIDENCE_SUMMARY environments_total=... projects_total=... git_repositories_total=... version_clusters_total=...
 VERSION_CLUSTER key=photo.jpg confidence=high evidence_quality=name+size+created+modified members=4 review_reclaim_private=... suggested_keep=...
 VERSION_MEMBER cluster_id=0 version_rank=3 modified_epoch=... path=/Users/.../photo v3.jpg
 
@@ -151,6 +152,16 @@ ERROR_PATH        path=/Users/.../Library/Mail reason=permission
 The values above are illustrative. Reports are TSV so agents can parse them without a custom API, while humans can still inspect them in a terminal or spreadsheet.
 
 ## Built for the real developer Mac
+
+## Measure before tuning
+
+Use the benchmark harness to compare worker counts on a representative tree. It reports elapsed time, metadata throughput, peak resident memory, and incomplete-scan signals:
+
+```sh
+scripts/benchmark-scan.sh "$HOME/Library" "1 2 4 8 16 32"
+```
+
+Tune against the fastest run that keeps `permission_errors=0` and `partial_directories=0`; maximum worker count is hardware- and filesystem-dependent.
 
 - **AI:** Hugging Face, model servers, LM Studio, Ollama, PyTorch, Core ML, datasets, embeddings, checkpoints
 - **Apple:** Xcode DerivedData, archives, DeviceSupport, SwiftPM, CocoaPods, CoreSimulator devices and runtimes

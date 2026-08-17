@@ -71,6 +71,122 @@ int ds_set_interactive_priority(void) {
     return setpriority(PRIO_PROCESS, 0, 10);
 }
 
+int ds_open_directory_fd(const char *path) {
+    if (path == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+}
+
+static int ds_open_relative_parent(int root_fd, const char *relative, int *parent_fd, char *leaf, size_t leaf_size) {
+    if (root_fd < 0 || relative == NULL || parent_fd == NULL || leaf == NULL || leaf_size == 0 || relative[0] == '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    char *copy = strdup(relative);
+    if (copy == NULL) {
+        return -1;
+    }
+    char *last_separator = strrchr(copy, '/');
+    char *parent_path = copy;
+    if (last_separator != NULL) {
+        *last_separator = '\0';
+        if (strlcpy(leaf, last_separator + 1, leaf_size) >= leaf_size) {
+            free(copy);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+    } else {
+        if (strlcpy(leaf, copy, leaf_size) >= leaf_size) {
+            free(copy);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        parent_path = copy + strlen(copy);
+    }
+    if (leaf[0] == '\0') {
+        free(copy);
+        errno = EINVAL;
+        return -1;
+    }
+
+    int current = dup(root_fd);
+    if (current < 0) {
+        free(copy);
+        return -1;
+    }
+    int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+    char *cursor = parent_path;
+    char *component = NULL;
+    while ((component = strsep(&cursor, "/")) != NULL) {
+        if (component[0] == '\0' || strcmp(component, ".") == 0) {
+            continue;
+        }
+        if (strcmp(component, "..") == 0) {
+            close(current);
+            free(copy);
+            errno = EINVAL;
+            return -1;
+        }
+        int next = openat(current, component, flags);
+        if (next < 0) {
+            close(current);
+            free(copy);
+            return -1;
+        }
+        close(current);
+        current = next;
+    }
+    free(copy);
+    *parent_fd = current;
+    return 0;
+}
+
+static int ds_remove_relative(int root_fd, const char *relative, uint64_t expected_device, uint64_t expected_inode, uint32_t expected_mode, int directory) {
+    if (relative == NULL || relative[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    char leaf[DS_NAME_CAPACITY];
+    int parent_fd = -1;
+    if (ds_open_relative_parent(root_fd, relative, &parent_fd, leaf, sizeof(leaf)) != 0) {
+        return -1;
+    }
+    struct stat metadata;
+    if (fstatat(parent_fd, leaf, &metadata, AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved = errno;
+        close(parent_fd);
+        errno = saved;
+        return -1;
+    }
+    if ((uint64_t)metadata.st_dev != expected_device || (uint64_t)metadata.st_ino != expected_inode ||
+        ((uint32_t)metadata.st_mode & S_IFMT) != (expected_mode & S_IFMT)) {
+        close(parent_fd);
+        errno = EAGAIN;
+        return -1;
+    }
+    int result = unlinkat(parent_fd, leaf, directory ? AT_REMOVEDIR : 0);
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return result;
+}
+
+int ds_unlink_relative(int root_fd, const char *relative, uint64_t expected_device, uint64_t expected_inode, uint32_t expected_mode) {
+    return ds_remove_relative(root_fd, relative, expected_device, expected_inode, expected_mode, 0);
+}
+
+int ds_remove_directory_relative(int root_fd, const char *relative, uint64_t expected_device, uint64_t expected_inode, uint32_t expected_mode) {
+    return ds_remove_relative(root_fd, relative, expected_device, expected_inode, expected_mode, 1);
+}
+
+void ds_close_fd(int fd) {
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
 size_t ds_recommended_fd_queue_limit(void) {
     struct rlimit limit;
     if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur == RLIM_INFINITY) {
@@ -134,9 +250,13 @@ typedef struct ds_dir {
     unsigned char *buffer;
 } ds_dir;
 
-static void ds_take(const unsigned char **cursor, void *destination, size_t size) {
+static int ds_take(const unsigned char **cursor, const unsigned char *end, void *destination, size_t size) {
+    if (cursor == NULL || *cursor == NULL || end == NULL || *cursor > end || size > (size_t)(end - *cursor)) {
+        return -1;
+    }
     memcpy(destination, *cursor, size);
     *cursor += size;
+    return 0;
 }
 
 ds_dir *ds_scanner_create(void) {
@@ -244,6 +364,12 @@ int ds_next_entry(ds_dir *directory, ds_entry *output) {
 
     memset(output, 0, sizeof(*output));
     const unsigned char *group = directory->cursor;
+    const unsigned char *buffer_end = directory->buffer + DS_BUFFER_SIZE;
+    if (group > buffer_end || sizeof(uint32_t) > (size_t)(buffer_end - group)) {
+        directory->last_errno = EIO;
+        errno = EIO;
+        return -1;
+    }
     const unsigned char *cursor = group;
     uint32_t group_length = 0;
     attribute_set_t returned;
@@ -254,7 +380,11 @@ int ds_next_entry(ds_dir *directory, ds_entry *output) {
     off_t allocated_size = 0;
     off_t private_size = 0;
 
-    ds_take(&cursor, &group_length, sizeof(group_length));
+    if (ds_take(&cursor, buffer_end, &group_length, sizeof(group_length)) != 0) {
+        directory->last_errno = EIO;
+        errno = EIO;
+        return -1;
+    }
     if (group_length < sizeof(uint32_t) + sizeof(attribute_set_t) ||
         group_length > DS_BUFFER_SIZE ||
         group + group_length > directory->buffer + DS_BUFFER_SIZE) {
@@ -265,33 +395,48 @@ int ds_next_entry(ds_dir *directory, ds_entry *output) {
     directory->cursor += group_length;
     directory->remaining -= 1;
 
-    ds_take(&cursor, &returned, sizeof(returned));
-    ds_take(&cursor, &output->error_code, sizeof(output->error_code));
+    const unsigned char *group_end = group + group_length;
+    if (ds_take(&cursor, group_end, &returned, sizeof(returned)) != 0 ||
+        !(returned.commonattr & ATTR_CMN_ERROR) || !(returned.commonattr & ATTR_CMN_NAME) ||
+        !(returned.commonattr & ATTR_CMN_DEVID) || !(returned.commonattr & ATTR_CMN_OBJTYPE) ||
+        !(returned.commonattr & ATTR_CMN_FILEID) ||
+        ds_take(&cursor, group_end, &output->error_code, sizeof(output->error_code)) != 0) {
+        directory->last_errno = EIO;
+        errno = EIO;
+        return -1;
+    }
     const unsigned char *name_reference_location = cursor;
-    ds_take(&cursor, &name_reference, sizeof(name_reference));
-    ds_take(&cursor, &device, sizeof(device));
-    ds_take(&cursor, &object_type, sizeof(object_type));
-    ds_take(&cursor, &output->file_id, sizeof(output->file_id));
+    if (ds_take(&cursor, group_end, &name_reference, sizeof(name_reference)) != 0 ||
+        ds_take(&cursor, group_end, &device, sizeof(device)) != 0 ||
+        ds_take(&cursor, group_end, &object_type, sizeof(object_type)) != 0 ||
+        ds_take(&cursor, group_end, &output->file_id, sizeof(output->file_id)) != 0) {
+        directory->last_errno = EIO;
+        errno = EIO;
+        return -1;
+    }
     if (returned.fileattr & ATTR_FILE_LINKCOUNT) {
-        ds_take(&cursor, &output->link_count, sizeof(output->link_count));
+        if (ds_take(&cursor, group_end, &output->link_count, sizeof(output->link_count)) != 0) { goto malformed_group; }
     }
     if (returned.fileattr & ATTR_FILE_TOTALSIZE) {
-        ds_take(&cursor, &logical_size, sizeof(logical_size));
+        if (ds_take(&cursor, group_end, &logical_size, sizeof(logical_size)) != 0) { goto malformed_group; }
     }
     if (returned.fileattr & ATTR_FILE_ALLOCSIZE) {
-        ds_take(&cursor, &allocated_size, sizeof(allocated_size));
+        if (ds_take(&cursor, group_end, &allocated_size, sizeof(allocated_size)) != 0) { goto malformed_group; }
     }
     if (returned.forkattr & ATTR_CMNEXT_PRIVATESIZE) {
-        ds_take(&cursor, &private_size, sizeof(private_size));
+        if (ds_take(&cursor, group_end, &private_size, sizeof(private_size)) != 0) { goto malformed_group; }
     }
 
-    const unsigned char *name = name_reference_location +
-                                name_reference.attr_dataoffset;
+    if (name_reference.attr_dataoffset < 0 || (uint32_t)name_reference.attr_dataoffset > group_length ||
+        name_reference.attr_length > group_length - (uint32_t)name_reference.attr_dataoffset) {
+        goto malformed_group;
+    }
+    const unsigned char *name = name_reference_location + name_reference.attr_dataoffset;
     size_t name_length = name_reference.attr_length;
     if (name_length > 0 && name[name_length - 1] == '\0') {
         name_length -= 1;
     }
-    if (name < group || name + name_length > group + group_length) {
+    if (name < group || name_length > (size_t)(group_end - name)) {
         output->error_code = EIO;
         name_length = 0;
     }
@@ -313,6 +458,11 @@ int ds_next_entry(ds_dir *directory, ds_entry *output) {
         output->private_size = private_size > 0 ? (uint64_t)private_size : 0;
     }
     return 1;
+
+malformed_group:
+    directory->last_errno = EIO;
+    errno = EIO;
+    return -1;
 }
 
 int ds_last_errno(ds_dir *directory) {
