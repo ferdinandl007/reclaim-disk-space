@@ -111,6 +111,7 @@ const CTX_GAME: u32 = 1 << 19;
 const CTX_MEDIA_PRODUCTION: u32 = 1 << 20;
 const CTX_INFRA: u32 = 1 << 21;
 const CTX_CONDA: u32 = 1 << 22;
+const CTX_PROJECT_TREE: u32 = 1 << 23;
 
 #[derive(Clone, Copy, Default)]
 struct Metrics {
@@ -122,6 +123,10 @@ struct Metrics {
     small: u64,
     small_text: u64,
     newest_modified_seconds: u64,
+    newest_source_modified_seconds: u64,
+    newest_generated_modified_seconds: u64,
+    source_files: u64,
+    generated_files: u64,
 }
 
 impl Metrics {
@@ -134,6 +139,10 @@ impl Metrics {
         self.small = self.small.saturating_add(other.small);
         self.small_text = self.small_text.saturating_add(other.small_text);
         self.newest_modified_seconds = self.newest_modified_seconds.max(other.newest_modified_seconds);
+        self.newest_source_modified_seconds = self.newest_source_modified_seconds.max(other.newest_source_modified_seconds);
+        self.newest_generated_modified_seconds = self.newest_generated_modified_seconds.max(other.newest_generated_modified_seconds);
+        self.source_files = self.source_files.saturating_add(other.source_files);
+        self.generated_files = self.generated_files.saturating_add(other.generated_files);
     }
 }
 
@@ -222,6 +231,7 @@ struct ScanResult {
     version_candidates_skipped: u64,
     project_kind: Option<&'static str>,
     environment_kind: Option<&'static str>,
+    timestamp_queries: u64,
     errors: Vec<PathBuf>,
     mounts_skipped: u64,
     entries_seen: u64,
@@ -239,6 +249,7 @@ struct SharedState {
     version_cluster_count: u64,
     version_candidates: u64,
     version_candidates_skipped: u64,
+    timestamp_queries: u64,
 }
 
 #[derive(Clone)]
@@ -740,6 +751,20 @@ fn classify_file(context: u32, name: &OsStr) -> (usize, bool) {
     (OTHER, false)
 }
 
+fn generated_context(context: u32) -> bool {
+    context & (CTX_AI | CTX_PYTHON_DEPS | CTX_JS_DEPS | CTX_PACKAGE_CACHE | CTX_XCODE | CTX_DOCKER | CTX_GIT | CTX_BUILD | CTX_BROWSER | CTX_LOGS | CTX_RUST | CTX_JVM | CTX_GO | CTX_DOTNET | CTX_RUBY_PHP | CTX_ANDROID | CTX_NATIVE | CTX_INFRA) != 0
+}
+
+fn activity_timestamp_needed(context: u32, name: &OsStr, version_candidate: bool) -> bool {
+    let lower = lower_name(name);
+    if version_candidate || project_marker_kind(name).is_some() || matches!(lower.as_str(), "pyvenv.cfg" | "conda-meta") {
+        return true;
+    }
+    if generated_context(context) { return false; }
+    let (category, text_like) = classify_file(context, name);
+    text_like || matches!(category, OTHER_MEDIA | MEDIA_PRODUCTION | IOS_SOURCE | GAME_ENGINE)
+}
+
 fn version_cluster_key(name: &OsStr) -> Option<(String, i32, bool)> {
     let lower = lower_name(name);
     let extension = extension(name);
@@ -978,6 +1003,14 @@ fn add_file_metrics(
     if logical <= 4096 { direct.tiny += 1; }
     if logical <= 65536 { direct.small += 1; }
     if logical <= 65536 && text_like { direct.small_text += 1; }
+    let generated = generated_context(context);
+    if generated {
+        direct.generated_files += 1;
+        direct.newest_generated_modified_seconds = direct.newest_generated_modified_seconds.max(modified_seconds);
+    } else {
+        direct.source_files += 1;
+        direct.newest_source_modified_seconds = direct.newest_source_modified_seconds.max(modified_seconds);
+    }
     direct.newest_modified_seconds = direct.newest_modified_seconds.max(modified_seconds);
     categories.add_file(
         category,
@@ -1005,6 +1038,7 @@ fn scan_directory_native(
     let mut version_candidates_skipped = 0;
     let mut project_kind = None;
     let mut environment_kind = None;
+    let mut timestamp_queries = 0;
     let mut errors = Vec::new();
     let mut mounts_skipped = 0;
     let mut entries_seen = 0;
@@ -1043,8 +1077,15 @@ fn scan_directory_native(
         if lower_entry_name == "pyvenv.cfg" { environment_kind = Some("python_venv"); }
         if lower_entry_name == "conda-meta" { environment_kind = Some("conda_env"); }
         let entry_context = if entry.object_type == VDIR { derive_context(task.context, &name) } else { task.context };
-        let (created_seconds, modified_seconds) = scanner.child_times(&name);
-        if version_candidate_allowed(entry_context, &name, version_cluster_key(&name).map(|value| value.2).unwrap_or(false)) {
+        let version_info = version_cluster_key(&name);
+        let version_candidate = version_candidate_allowed(entry_context, &name, version_info.as_ref().map(|value| value.2).unwrap_or(false));
+        let (created_seconds, modified_seconds) = if activity_timestamp_needed(entry_context, &name, version_candidate) {
+            timestamp_queries += 1;
+            scanner.child_times(&name)
+        } else {
+            (0, 0)
+        };
+        if version_candidate {
             maybe_collect_version_candidate(
                 &mut version_groups,
                 &mut version_candidates,
@@ -1099,7 +1140,7 @@ fn scan_directory_native(
     scanner.close();
 
     let (version_clusters, version_cluster_count) = finalize_version_groups(version_groups);
-    Some(ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, environment_kind, errors, mounts_skipped, entries_seen })
+    Some(ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, environment_kind, timestamp_queries, errors, mounts_skipped, entries_seen })
 }
 
 fn scan_directory_fallback(
@@ -1115,6 +1156,7 @@ fn scan_directory_fallback(
     let mut version_candidates_skipped = 0;
     let mut project_kind = None;
     let mut environment_kind = None;
+    let mut timestamp_queries = 0;
     let mut errors = Vec::new();
     let mut mounts_skipped = 0;
     let mut entries_seen = 0;
@@ -1146,11 +1188,13 @@ fn scan_directory_fallback(
                     let context = derive_context(task.context, &name);
                     let created_seconds = metadata.created().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     let modified_seconds = metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
+                    timestamp_queries += 1;
                     maybe_collect_version_candidate(&mut version_groups, &mut version_candidates, &mut version_candidates_skipped, context, &name, path.clone(), metadata.len(), allocated(&metadata), 0, created_seconds, modified_seconds);
                     children.push((path, context, None));
                 } else if file_type.is_file() {
                     let modified_seconds = metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     let created_seconds = metadata.created().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
+                    timestamp_queries += 1;
                     maybe_collect_version_candidate(&mut version_groups, &mut version_candidates, &mut version_candidates_skipped, task.context, &name, path, metadata.len(), allocated(&metadata), 0, created_seconds, modified_seconds);
                     add_file_metrics(
                         &mut direct,
@@ -1173,7 +1217,7 @@ fn scan_directory_fallback(
     }
 
     let (version_clusters, version_cluster_count) = finalize_version_groups(version_groups);
-    ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, environment_kind, errors, mounts_skipped, entries_seen }
+    ScanResult { id: task.id, direct, children, version_clusters, version_cluster_count, version_candidates, version_candidates_skipped, project_kind, environment_kind, timestamp_queries, errors, mounts_skipped, entries_seen }
 }
 
 fn scan_directory(
@@ -1264,6 +1308,7 @@ fn worker(
             state.version_cluster_count = state.version_cluster_count.saturating_add(result.version_cluster_count);
             state.version_candidates = state.version_candidates.saturating_add(result.version_candidates);
             state.version_candidates_skipped = state.version_candidates_skipped.saturating_add(result.version_candidates_skipped);
+            state.timestamp_queries = state.timestamp_queries.saturating_add(result.timestamp_queries);
             for cluster in result.version_clusters {
                 state.version_clusters.push(cluster);
                 state.version_clusters.sort_unstable_by(|a, b| b.review_reclaim_private.cmp(&a.review_reclaim_private).then_with(|| b.review_reclaim_physical.cmp(&a.review_reclaim_physical)));
@@ -1274,16 +1319,17 @@ fn worker(
             for (child_path, context, directory_fd) in result.children {
                 let id = state.records.len() as u32;
                 let name = child_path.file_name().unwrap_or_else(|| OsStr::new("")).to_os_string();
+                let child_context = if result.project_kind.is_some() { context | CTX_PROJECT_TREE } else { context };
                 state.records.push(DirectoryRecord {
                     name,
                     parent: Some(result.id),
-                    context,
+                    context: child_context,
                     direct: Metrics::default(),
                     total: Metrics::default(),
                     environment_kind: environment_kind_for_child(&parent_name, child_path.file_name().unwrap_or_else(|| OsStr::new("")), parent_context),
                     project_kind: None,
                 });
-                state.queue.push_back(Task { id, path: child_path, context, directory_fd });
+                state.queue.push_back(Task { id, path: child_path, context: child_context, directory_fd });
             }
             state.permission_errors += result.errors.len() as u64;
             state.mounts_skipped += result.mounts_skipped;
@@ -1448,6 +1494,7 @@ fn main() {
         version_cluster_count: 0,
         version_candidates: 0,
         version_candidates_skipped: 0,
+        timestamp_queries: 0,
     };
 
     let shared = Arc::new((Mutex::new(initial), Condvar::new()));
@@ -1572,7 +1619,7 @@ fn main() {
     }
 
     println!(
-        "SUMMARY\troot={}\tprivate={}\tallocated={}\tlogical={}\tdirectories={}\tfiles={}\ttiny={}\tsmall={}\tsmall_text={}\thardlink_duplicates={}\tpermission_errors={}\tmounts_skipped={}\tversion_candidates={}\tversion_candidates_skipped={}\tversion_clusters={}\tworker_mode={}\tworkers_initial={}\tworkers_final={}\tworkers_best={}\tworkers_peak={}\tworkers_spawned={}\tworkers_max={}\tworkers_resource_limit={}\tlogical_cpus={}\tcpu_budget_cores={:.2}\tpeak_cpu_cores={:.2}\thost_busy_budget={:.2}\tpeak_host_busy={:.2}\tautotune_probes={}\tautotune_accepted={}\tautotune_rejected={}\tpeak_entries_per_second={:.0}\tmetadata_entries={}\tmetadata_directories={}\tmetadata_worker_seconds={:.2}\tqueued_fd_limit={}\tmetadata_backend=macos_getattrlistbulk_openat\telapsed_seconds={:.2}",
+        "SUMMARY\troot={}\tprivate={}\tallocated={}\tlogical={}\tdirectories={}\tfiles={}\ttiny={}\tsmall={}\tsmall_text={}\thardlink_duplicates={}\tpermission_errors={}\tmounts_skipped={}\tversion_candidates={}\tversion_candidates_skipped={}\tversion_clusters={}\ttimestamp_queries={}\tworker_mode={}\tworkers_initial={}\tworkers_final={}\tworkers_best={}\tworkers_peak={}\tworkers_spawned={}\tworkers_max={}\tworkers_resource_limit={}\tlogical_cpus={}\tcpu_budget_cores={:.2}\tpeak_cpu_cores={:.2}\thost_busy_budget={:.2}\tpeak_host_busy={:.2}\tautotune_probes={}\tautotune_accepted={}\tautotune_rejected={}\tpeak_entries_per_second={:.0}\tmetadata_entries={}\tmetadata_directories={}\tmetadata_worker_seconds={:.2}\tqueued_fd_limit={}\tmetadata_backend=macos_getattrlistbulk_openat\telapsed_seconds={:.2}",
         root.display(),
         format_size(state.records[0].total.private),
         format_size(state.records[0].total.physical),
@@ -1588,6 +1635,7 @@ fn main() {
         state.version_candidates,
         state.version_candidates_skipped,
         state.version_cluster_count,
+        state.timestamp_queries,
         if interactive_profile { "interactive" } else if max_profile { "max-throughput" } else { "fixed" },
         initial_workers,
         target_workers.load(Ordering::Relaxed),
@@ -1698,12 +1746,15 @@ fn main() {
     );
     for id in project_ids.into_iter().take(PROJECT_TOP_K) {
         let record = &state.records[id as usize];
-        let newest = record.total.newest_modified_seconds;
+        let newest = record.total.newest_source_modified_seconds;
+        let generated_newest = record.total.newest_generated_modified_seconds;
         let age_days = if newest > 0 && now_seconds >= newest { Some((now_seconds - newest) / 86_400) } else { None };
+        let generated_age_days = if generated_newest > 0 && now_seconds >= generated_newest { Some((now_seconds - generated_newest) / 86_400) } else { None };
         let age_label = age_days.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string());
-        let stale = age_days.map(|value| value >= STALE_REVIEW_DAYS).unwrap_or(false);
+        let generated_age_label = generated_age_days.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string());
+        let stale = age_days.map(|value| if value >= STALE_REVIEW_DAYS { "true" } else { "false" }).unwrap_or("unknown");
         println!(
-            "PROJECT\tkind={}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\tnewest_modified_epoch={}\tage_days={}\tstale_review={}\tpath={}",
+            "PROJECT\tkind={}\tprivate_bytes={}\tallocated_bytes={}\tlogical_bytes={}\tprivate={}\tallocated={}\tlogical={}\tfiles={}\tsource_files={}\tgenerated_files={}\tnewest_source_modified_epoch={}\tsource_age_days={}\tnewest_generated_modified_epoch={}\tgenerated_age_days={}\tstale_review={}\tpath={}",
             record.project_kind.unwrap_or("project"),
             record.total.private,
             record.total.physical,
@@ -1712,8 +1763,12 @@ fn main() {
             format_size(record.total.physical),
             format_size(record.total.logical),
             record.total.files,
+            record.total.source_files,
+            record.total.generated_files,
             newest,
             age_label,
+            generated_newest,
+            generated_age_label,
             stale,
             path_for(&root, &state.records, id).display(),
         );

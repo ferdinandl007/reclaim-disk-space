@@ -48,7 +48,7 @@ Build and run with:
 scripts/run-disk-scout.sh /System/Volumes/Data auto > /tmp/disk-scout-report.tsv
 ```
 
-The runner rebuilds when its Rust or C source changes. The scanner uses a macOS `getattrlistbulk` C shim, adaptive directory-level concurrency, hard-link deduplication, compact parent-linked directory records, streaming top-K lists, filesystem birth/modified times, and no subprocess per file. `auto` is the default interactive profile: it lowers process priority, derives its exploration ceiling from cores, RAM, and descriptor limits, monitors its own CPU use and host load, backs off to preserve responsiveness, and periodically reprobes. Use `max-throughput` only for an explicitly approved unattended run. Pass an integer only for controlled benchmarks or debugging.
+The runner rebuilds when its Rust or C source changes. The scanner uses a macOS `getattrlistbulk` C shim, adaptive directory-level concurrency, hard-link deduplication, compact parent-linked directory records, streaming top-K lists, selective filesystem birth/modified-time queries, and no subprocess per file. `auto` is the default interactive profile: it lowers process priority, derives its exploration ceiling from cores, RAM, and descriptor limits, monitors its own CPU use and host load, backs off to preserve responsiveness, and periodically reprobes. Use `max-throughput` only for an explicitly approved unattended run. Pass an integer only for controlled benchmarks or debugging.
 
 For a focused scan:
 
@@ -63,9 +63,10 @@ Interpret output as follows:
 - `logical`: apparent file lengths; sparse files and clones can make this misleading.
 - `tiny`, `small`, `small_text`: inode-heavy populations that can make tools and backups slow even when byte totals are moderate.
 - `EXTENSION`: dynamically discovered extension totals, including `<none>` and unknown formats. Semantic categories never replace this raw accounting.
+- `timestamp_queries`: how many entries required an exact native timestamp lookup; a much smaller number than total entries is expected in the fast path.
 - `CATEGORY`: optional path and format-based interpretation for stores whose extensions alone are ambiguous.
 - `ENVIRONMENT`: every detected standard or marker-confirmed Python environment (`.venv`, `venv`, `virtualenv`, `.python`, or a directory containing `pyvenv.cfg`) plus Conda environments under Conda `envs` roots or containing `conda-meta`, with independent totals, newest modified epoch, age, and a `stale_review` hint. This is an inventory signal, not deletion authority.
-- `PROJECT`: detected Python, JavaScript, Rust, Go, iOS, Docker, JVM, and related project roots, with independent totals and an age-based stale-review hint. A project is never automatically selected for deletion.
+- `PROJECT`: detected Python, JavaScript, Rust, Go, iOS, Docker, JVM, and related project roots, with source/generated file totals, source activity age, and a stale-review hint. `stale_review=unknown` means source activity metadata was unavailable. A project is never automatically selected for deletion.
 - `EVIDENCE_SUMMARY`: total versus reported record counts, including any bounded-report truncation.
 - `VERSION_CLUSTER` and `VERSION_MEMBER`: conservative same-directory families such as `photo.jpg`, `photo v2.jpg`, `photo (3).jpg`, or exported app variants. They combine filename normalization, size similarity, and creation/modified-date proximity; `evidence_quality` exposes which signals were actually available, and `suggested_keep` is only a review starting point.
 - `TOP_*`: overlapping directory rankings. Select independent branches before summing.
@@ -82,7 +83,7 @@ Review these surfaces when their categories or paths are prominent:
 - Media: Final Cut, Premiere, After Effects, DaVinci Resolve, Blender, proxies, optimized media, render caches, waveform or thumbnail caches, and raw project assets.
 - Applications: messaging attachments, browser or editor caches and state databases, local mail, Photos, cloud-sync offline copies, crash logs, and update or install remnants.
 
-When a cleanup candidate is old, inspect the matching `ENVIRONMENT`, `PROJECT`, or `VERSION_CLUSTER` records together with the exact path. Age is based on the newest file observed in that tree and can be unknown when metadata is unavailable; it is deliberately a review hint rather than a hardcoded deletion rule.
+When a cleanup candidate is old, inspect the matching `ENVIRONMENT`, `PROJECT`, or `VERSION_CLUSTER` records together with the exact path. Project age is based on the newest source/configuration activity observed, while generated/cache activity is reported separately; it can be unknown when metadata is unavailable and is deliberately a review hint rather than a hardcoded deletion rule.
 
 Use [references/stack-cleanup-playbook.md](references/stack-cleanup-playbook.md) for stack-specific inspection and preferred cleanup mechanisms.
 

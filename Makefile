@@ -16,6 +16,7 @@ build:
 
 test: build
 	./scripts/test-safety.sh
+	./scripts/test-scout.sh
 
 scan: build
 	$(SCRIPTS)/run-disk-scout.sh "$(ROOT)" "$(PROFILE)" > "$(OUT)"
