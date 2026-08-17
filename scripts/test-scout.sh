@@ -39,6 +39,7 @@ touch -t 202001010000 \
     "$FIXTURE/project/.venv/pyvenv.cfg"
 
 "$SCANNER" "$FIXTURE" 2 > "$REPORT"
+grep -q '^SUMMARY.*profiling=false' "$REPORT"
 grep -q '^SUMMARY.*timestamp_queries=' "$REPORT"
 timestamp_queries=$(awk -F '\t' '/^SUMMARY/{for (i = 1; i <= NF; i++) if ($i ~ /^timestamp_queries=/) { split($i, parts, "="); print parts[2] }}' "$REPORT")
 [ "$timestamp_queries" -lt 40 ]
@@ -72,5 +73,9 @@ printf '%s\n' modified >> "$FIXTURE/git-project/main.py"
 DIRTY_REPORT="$FIXTURE/dirty-report.tsv"
 "$SCANNER" "$FIXTURE" 2 > "$DIRTY_REPORT"
 grep -q '^GIT_REPOSITORY.*worktree_state=dirty.*modified_tracked_files=1' "$DIRTY_REPORT"
+
+PROFILE_REPORT="$FIXTURE/profile-report.tsv"
+DISK_SCOUT_PROFILE=1 "$SCANNER" "$FIXTURE" 2 > "$PROFILE_REPORT"
+grep -q '^SUMMARY.*profiling=true' "$PROFILE_REPORT"
 
 echo "Scanner fixture checks passed"

@@ -642,6 +642,10 @@ fn lower_name<'a>(value: &'a OsStr) -> Cow<'a, str> {
     }
 }
 
+fn profiling_enabled(variable: &str) -> bool {
+    matches!(env::var(variable).ok().as_deref(), Some("1" | "true" | "yes" | "on"))
+}
+
 fn derive_context(parent: u32, name: &OsStr) -> u32 {
     let value = lower_name(name);
     derive_context_lower(parent, &value)
@@ -1555,6 +1559,7 @@ fn worker(
     telemetry: Arc<Vec<WorkerTelemetry>>,
     queued_fds: Arc<AtomicUsize>,
     queued_fd_limit: usize,
+    profile_enabled: bool,
 ) -> CategoryTotals {
     let mut category_totals = CategoryTotals::default();
     let mut native_scanner = NativeScanner::new();
@@ -1589,7 +1594,7 @@ fn worker(
         let mut results = Vec::with_capacity(tasks.len());
         for task in &mut tasks {
             let held_directory_fd = task.directory_fd.is_some();
-            let scan_started = Instant::now();
+            let scan_started = profile_enabled.then(Instant::now);
             let result = scan_directory(
                 &mut native_scanner,
                 task,
@@ -1604,10 +1609,12 @@ fn worker(
             }
             telemetry[worker_id].entries.fetch_add(result.entries_seen, Ordering::Relaxed);
             telemetry[worker_id].directories.fetch_add(1, Ordering::Relaxed);
-            telemetry[worker_id].scan_nanos.fetch_add(
-                scan_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
+            if let Some(scan_started) = scan_started {
+                telemetry[worker_id].scan_nanos.fetch_add(
+                    scan_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+            }
             results.push(result);
         }
 
@@ -1680,6 +1687,7 @@ fn spawn_worker_thread(
     telemetry: Arc<Vec<WorkerTelemetry>>,
     queued_fds: Arc<AtomicUsize>,
     queued_fd_limit: usize,
+    profile_enabled: bool,
 ) -> std::io::Result<thread::JoinHandle<CategoryTotals>> {
     thread::Builder::new()
         .name(format!("disk-scout-{worker_id}"))
@@ -1694,6 +1702,7 @@ fn spawn_worker_thread(
                 telemetry,
                 queued_fds,
                 queued_fd_limit,
+                profile_enabled,
             )
         })
 }
@@ -1852,6 +1861,7 @@ fn main() {
     let hardlinks = Arc::new(HardlinkSet::new());
     let target_workers = Arc::new(AtomicUsize::new(initial_workers));
     let telemetry = Arc::new((0..max_workers).map(|_| WorkerTelemetry::default()).collect::<Vec<_>>());
+    let profile_enabled = profiling_enabled("DISK_SCOUT_PROFILE");
     let queued_fds = Arc::new(AtomicUsize::new(0));
     let queued_fd_limit = unsafe { ds_recommended_fd_queue_limit() };
     let started = Instant::now();
@@ -1874,6 +1884,7 @@ fn main() {
             telemetry.clone(),
             queued_fds.clone(),
             queued_fd_limit,
+            profile_enabled,
         ).expect("unable to spawn initial scanner worker"));
     }
     if !auto_tune {
@@ -1887,6 +1898,7 @@ fn main() {
                 telemetry.clone(),
                 queued_fds.clone(),
                 queued_fd_limit,
+                profile_enabled,
             ).expect("unable to spawn requested fixed scanner workers"));
         }
     }
@@ -1918,6 +1930,7 @@ fn main() {
                             telemetry.clone(),
                             queued_fds.clone(),
                             queued_fd_limit,
+                            profile_enabled,
                         ) {
                             Ok(handle) => workers.push(handle),
                             Err(_) => break,
@@ -1970,7 +1983,7 @@ fn main() {
     }
 
     println!(
-        "SUMMARY\troot={}\tprivate={}\tallocated={}\tlogical={}\tdirectories={}\tnative_directories={}\tfallback_directories={}\tpartial_directories={}\tfiles={}\ttiny={}\tsmall={}\tsmall_text={}\thardlink_duplicates={}\thardlink_tracking_saturated={}\tpermission_errors={}\tmounts_skipped={}\tversion_candidates={}\tversion_candidates_skipped={}\tversion_clusters={}\ttimestamp_queries={}\ttimestamp_failures={}\tworker_mode={}\tworkers_initial={}\tworkers_final={}\tworkers_best={}\tworkers_peak={}\tworkers_spawned={}\tworkers_max={}\tworkers_resource_limit={}\tlogical_cpus={}\tcpu_budget_cores={:.2}\tpeak_cpu_cores={:.2}\thost_busy_budget={:.2}\tpeak_host_busy={:.2}\tautotune_probes={}\tautotune_accepted={}\tautotune_rejected={}\tpeak_entries_per_second={:.0}\tmetadata_entries={}\tmetadata_directories={}\tmetadata_worker_seconds={:.2}\tqueued_fd_limit={}\tmetadata_backend=macos_getattrlistbulk_openat\telapsed_seconds={:.2}",
+        "SUMMARY\troot={}\tprivate={}\tallocated={}\tlogical={}\tdirectories={}\tnative_directories={}\tfallback_directories={}\tpartial_directories={}\tfiles={}\ttiny={}\tsmall={}\tsmall_text={}\thardlink_duplicates={}\thardlink_tracking_saturated={}\tpermission_errors={}\tmounts_skipped={}\tversion_candidates={}\tversion_candidates_skipped={}\tversion_clusters={}\ttimestamp_queries={}\ttimestamp_failures={}\tworker_mode={}\tworkers_initial={}\tworkers_final={}\tworkers_best={}\tworkers_peak={}\tworkers_spawned={}\tworkers_max={}\tworkers_resource_limit={}\tlogical_cpus={}\tcpu_budget_cores={:.2}\tpeak_cpu_cores={:.2}\thost_busy_budget={:.2}\tpeak_host_busy={:.2}\tautotune_probes={}\tautotune_accepted={}\tautotune_rejected={}\tpeak_entries_per_second={:.0}\tmetadata_entries={}\tmetadata_directories={}\tmetadata_worker_seconds={:.2}\tprofiling={}\tqueued_fd_limit={}\tmetadata_backend=macos_getattrlistbulk_openat\telapsed_seconds={:.2}",
         escape_path(&root),
         format_size(state.records[0].total.private),
         format_size(state.records[0].total.physical),
@@ -2012,6 +2025,7 @@ fn main() {
         metadata_entries,
         metadata_directories,
         metadata_scan_nanos as f64 / 1_000_000_000.0,
+        profile_enabled,
         queued_fd_limit,
         started.elapsed().as_secs_f64(),
     );

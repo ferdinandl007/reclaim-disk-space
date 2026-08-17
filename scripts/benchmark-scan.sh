@@ -13,7 +13,7 @@ printf 'workers\telapsed_seconds\tmetadata_entries\tpeak_rss_bytes\tuser_seconds
 for worker in $WORKERS; do
     report="$WORK_DIR/report-$worker.tsv"
     timing="$WORK_DIR/timing-$worker.txt"
-    /usr/bin/time -l "$SCANNER" "$ROOT" "$worker" > "$report" 2> "$timing"
+    env DISK_SCOUT_PROFILE=1 /usr/bin/time -l "$SCANNER" "$ROOT" "$worker" > "$report" 2> "$timing"
     summary=$(awk -F '\t' '/^SUMMARY/{print; exit}' "$report")
     field() { printf '%s\n' "$summary" | awk -F '\t' -v key="$1" '{for (i = 1; i <= NF; i++) if ($i ~ "^" key "=") { sub("^" key "=", "", $i); print $i; exit }}'; }
     rss=$(awk '/maximum resident set size/ { print $1; exit }' "$timing")

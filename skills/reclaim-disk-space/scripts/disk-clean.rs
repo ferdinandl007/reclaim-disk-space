@@ -35,6 +35,10 @@ fn escape_path(path: &Path) -> String {
     escape_tsv(&path.to_string_lossy())
 }
 
+fn profiling_enabled(variable: &str) -> bool {
+    matches!(env::var(variable).ok().as_deref(), Some("1" | "true" | "yes" | "on"))
+}
+
 extern "C" {
     fn ds_open_directory_fd(path: *const c_char) -> RawFd;
     fn ds_unlink_relative(root_fd: RawFd, relative: *const c_char, expected_device: u64, expected_inode: u64, expected_mode: u32) -> i32;
@@ -431,6 +435,7 @@ fn spawn_worker(
     root_fd: RawFd,
     nodes: Arc<Vec<DeleteTarget>>,
     stats: Arc<DeleteStats>,
+    profile_enabled: bool,
 ) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("disk-clean-{worker_id}"))
@@ -444,7 +449,7 @@ fn spawn_worker(
                 if index >= nodes.len() {
                     break;
                 }
-                let started = Instant::now();
+                let started = profile_enabled.then(Instant::now);
                 stats.attempted.fetch_add(1, Ordering::Relaxed);
                 match remove_node(root_fd, &nodes[index]) {
                     Ok(true) => { stats.deleted.fetch_add(1, Ordering::Relaxed); }
@@ -453,7 +458,9 @@ fn spawn_worker(
                         record_error(&stats, &nodes[index].relative, &error);
                     }
                 }
-                stats.op_nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if let Some(started) = started {
+                    stats.op_nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 stats.completed.fetch_add(1, Ordering::Release);
             }
         })
@@ -464,7 +471,7 @@ fn free_bytes(root: &Path) -> u64 {
     unsafe { ds_free_bytes(value.as_ptr() as *const c_char) }
 }
 
-fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: usize, interactive: bool, logical_cpus: u32) -> DeleteStats {
+fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: usize, interactive: bool, logical_cpus: u32, profile_enabled: bool) -> DeleteStats {
     let nodes = Arc::new(nodes);
     let stats = Arc::new(DeleteStats::default());
     let initial = if interactive {
@@ -475,7 +482,7 @@ fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: 
     stats.target_workers.store(initial, Ordering::Relaxed);
     let mut workers = Vec::new();
     for worker_id in 0..initial {
-        workers.push(spawn_worker(worker_id, root_fd, nodes.clone(), stats.clone()).expect("worker spawn failed"));
+        workers.push(spawn_worker(worker_id, root_fd, nodes.clone(), stats.clone(), profile_enabled).expect("worker spawn failed"));
     }
     stats.workers_peak.store(workers.len(), Ordering::Relaxed);
 
@@ -501,7 +508,7 @@ fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: 
             thread::sleep(remaining.min(Duration::from_millis(10)));
             continue;
         }
-        let op_nanos = stats.op_nanos.load(Ordering::Relaxed);
+        let op_nanos = if profile_enabled { stats.op_nanos.load(Ordering::Relaxed) } else { 0 };
         let elapsed = now.duration_since(last).as_secs_f64().max(0.001);
         let delta = completed.saturating_sub(last_completed);
         let rate = delta as f64 / elapsed;
@@ -581,7 +588,7 @@ fn delete_nodes(root: &Path, root_fd: RawFd, nodes: Vec<DeleteTarget>, maximum: 
 
         while workers.len() < target {
             let worker_id = workers.len();
-            match spawn_worker(worker_id, root_fd, nodes.clone(), stats.clone()) {
+            match spawn_worker(worker_id, root_fd, nodes.clone(), stats.clone(), profile_enabled) {
                 Ok(worker) => workers.push(worker),
                 Err(_) => {
                     target = workers.len().max(1);
@@ -676,6 +683,7 @@ fn main() {
         eprintln!("ERROR\troot={}\t{error}", escape_path(&root));
         std::process::exit(2);
     });
+    let profile_enabled = profiling_enabled("DISK_CLEAN_PROFILE");
     if !config.max_throughput { unsafe { ds_set_interactive_priority(); } }
     if config.execute {
         let confirmed = config.confirmation.as_deref().and_then(|value| value.canonicalize().ok());
@@ -734,7 +742,7 @@ fn main() {
             std::process::exit(1);
         });
         if batch.is_empty() { break; }
-        totals.absorb(delete_nodes(&root, root_fd, batch, maximum, !config.max_throughput, logical_cpus));
+        totals.absorb(delete_nodes(&root, root_fd, batch, maximum, !config.max_throughput, logical_cpus, profile_enabled));
     }
     drop(spool_reader);
     let _ = fs::remove_file(&found.node_spool);
@@ -744,9 +752,9 @@ fn main() {
     let directory_errors = totals.errors.saturating_sub(errors_before_directories);
     unsafe { ds_close_fd(root_fd); }
     println!(
-        "SUMMARY\troot={}\tnodes_attempted={}\tnodes_deleted={}\tnodes_not_found={}\tdirectories_attempted={}\terrors={}\tdirectory_errors={}\tprofile={}\tlogical_cpus={}\tworkers_peak={}\tworker_ceiling={}\tfree={}",
+        "SUMMARY\troot={}\tnodes_attempted={}\tnodes_deleted={}\tnodes_not_found={}\tdirectories_attempted={}\terrors={}\tdirectory_errors={}\tprofile={}\tprofiling={}\tlogical_cpus={}\tworkers_peak={}\tworker_ceiling={}\tfree={}",
         escape_path(&root), totals.attempted, totals.deleted, totals.not_found, directories_attempted, totals.errors,
-        directory_errors, if config.max_throughput { "max-throughput" } else { "interactive" }, logical_cpus,
+        directory_errors, if config.max_throughput { "max-throughput" } else { "interactive" }, profile_enabled, logical_cpus,
         totals.workers_peak, maximum,
         format_size(free_bytes(root.parent().unwrap_or(Path::new("/"))))
     );

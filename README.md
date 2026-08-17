@@ -163,7 +163,7 @@ scripts/benchmark-clean.sh "1 2 4 8" 8192
 ```
 
 Tune against the fastest run that keeps `permission_errors=0` and `partial_directories=0`; maximum worker count is hardware- and filesystem-dependent.
-The `make profile ROOT=/path/to/representative/tree` target runs both scanner and guarded-cleaner throughput sweeps and includes peak RSS from macOS process accounting. Use a disposable copy for the cleaner benchmark because its execute mode removes the fixture.
+The `make profile ROOT=/path/to/representative/tree` target runs both scanner and guarded-cleaner throughput sweeps and includes peak RSS from macOS process accounting. The benchmark harness explicitly enables `DISK_SCOUT_PROFILE=1` and `DISK_CLEAN_PROFILE=1`; normal scans and cleanups leave those detailed per-operation timers off. Use a disposable copy for the cleaner benchmark because its execute mode removes the fixture.
 
 - **AI:** Hugging Face, model servers, LM Studio, Ollama, PyTorch, Core ML, datasets, embeddings, checkpoints
 - **Apple:** Xcode DerivedData, archives, DeviceSupport, SwiftPM, CocoaPods, CoreSimulator devices and runtimes

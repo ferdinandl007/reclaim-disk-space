@@ -21,7 +21,7 @@ for worker in $WORKERS; do
         : > "$root/file-$i.txt"
         i=$((i + 1))
     done
-    /usr/bin/time -l "$CLEANER" --root "$root" --execute --confirm "$root" --workers "$worker" --profile max-throughput > "$report" 2> "$timing"
+    env DISK_CLEAN_PROFILE=1 /usr/bin/time -l "$CLEANER" --root "$root" --execute --confirm "$root" --workers "$worker" --profile max-throughput > "$report" 2> "$timing"
     summary=$(awk -F '\t' '/^SUMMARY/{print; exit}' "$report")
     field() { printf '%s\n' "$summary" | awk -F '\t' -v key="$1" '{for (i = 1; i <= NF; i++) if ($i ~ "^" key "=") { sub("^" key "=", "", $i); print $i; exit }}'; }
     elapsed=$(awk '/real/ {print $1; exit}' "$timing")

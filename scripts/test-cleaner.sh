@@ -12,6 +12,12 @@ printf '%s\n' protected > "$WORK_DIR/external/secret.txt"
 "$CLEANER" --root "$WORK_DIR/normal" --execute --confirm "$WORK_DIR/normal" --workers 1 --profile max-throughput > "$WORK_DIR/normal-report.tsv" 2> "$WORK_DIR/normal-errors.log"
 test ! -e "$WORK_DIR/normal"
 test -f "$WORK_DIR/external/secret.txt"
+grep -q '^SUMMARY.*profiling=false' "$WORK_DIR/normal-report.tsv"
+
+mkdir -p "$WORK_DIR/profile"
+printf '%s\n' profile > "$WORK_DIR/profile/file.txt"
+DISK_CLEAN_PROFILE=1 "$CLEANER" --root "$WORK_DIR/profile" --execute --confirm "$WORK_DIR/profile" --workers 1 --profile max-throughput > "$WORK_DIR/profile-report.tsv" 2> "$WORK_DIR/profile-errors.log"
+grep -q '^SUMMARY.*profiling=true' "$WORK_DIR/profile-report.tsv"
 
 mkdir -p "$WORK_DIR/race/raced" "$WORK_DIR/race-external"
 printf '%s\n' protected > "$WORK_DIR/race-external/secret.txt"
