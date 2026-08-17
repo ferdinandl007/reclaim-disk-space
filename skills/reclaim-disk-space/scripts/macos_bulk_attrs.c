@@ -4,6 +4,7 @@
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <mach/mach.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -189,6 +190,20 @@ int ds_scanner_open_child(ds_dir *directory, const char *name) {
         return -1;
     }
     return openat(directory->fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+}
+
+int ds_scanner_child_times(ds_dir *directory, const char *name, uint64_t *created_seconds, uint64_t *modified_seconds) {
+    if (directory == NULL || directory->fd < 0 || name == NULL || created_seconds == NULL || modified_seconds == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct stat metadata;
+    if (fstatat(directory->fd, name, &metadata, AT_SYMLINK_NOFOLLOW) != 0) {
+        return -1;
+    }
+    *created_seconds = metadata.st_birthtimespec.tv_sec > 0 ? (uint64_t)metadata.st_birthtimespec.tv_sec : 0;
+    *modified_seconds = metadata.st_mtimespec.tv_sec > 0 ? (uint64_t)metadata.st_mtimespec.tv_sec : 0;
+    return 0;
 }
 
 int ds_next_entry(ds_dir *directory, ds_entry *output) {

@@ -135,6 +135,12 @@ EXTENSION name=<none>       private=...
 EXTENSION name=safetensors  private=...
 EXTENSION name=sqlite       private=...
 
+ENVIRONMENT kind=python_venv private=... age_days=... stale_review=true path=/Users/.../project/.venv
+ENVIRONMENT kind=conda_env  private=... age_days=... stale_review=true path=/Users/.../miniconda3/envs/old-ai
+PROJECT kind=rust_project  private=... age_days=... stale_review=false path=/Users/.../src/tool
+VERSION_CLUSTER key=photo.jpg confidence=high members=4 review_reclaim_private=... suggested_keep=...
+VERSION_MEMBER cluster_id=0 version_rank=3 modified_epoch=... path=/Users/.../photo v3.jpg
+
 TOP_PRIVATE       path=/Users/.../Library/Developer/CoreSimulator
 SMALL_TEXT_HOTSPOT path=/Users/.../.cache/.../metadata
 ERROR_PATH        path=/Users/.../Library/Mail reason=permission
@@ -150,6 +156,7 @@ The values above are illustrative. Reports are TSV so agents can parse them with
 - **Languages:** Python/uv/pip/Conda, JavaScript/npm/pnpm/Yarn/Bun, Rust/Cargo, Go, JVM/Gradle/Maven, .NET/NuGet, Ruby, PHP
 - **Native and media:** C/C++, CMake, Conan, vcpkg, Android, Blender, Final Cut, Premiere, Resolve, proxies, renders, thumbnails
 - **The unknown:** extensionless stores and new formats remain visible in the raw dynamic tables
+- **Long-tail waste:** version families, Python/Conda environment inventories, and stale project roots are emitted as agent-readable review records
 
 ## Performance without the fan apocalypse
 
