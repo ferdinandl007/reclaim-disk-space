@@ -1,9 +1,11 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::borrow::Cow;
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CString, OsStr, OsString};
+use std::mem::MaybeUninit;
 use std::fs;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -181,12 +183,15 @@ impl CategoryTotals {
     fn add_file(&mut self, category: usize, extension: String, logical: u64, physical: u64, private: u64, text_like: bool) {
         let metric = &mut self.values[category];
         Self::add_metric(metric, logical, physical, private, text_like);
-        let key = if self.extensions.contains_key(&extension) || self.extensions.len() < MAX_EXTENSION_KEYS {
-            extension
-        } else {
-            "<other>".to_string()
+        let room = self.extensions.len() < MAX_EXTENSION_KEYS;
+        let extension_metric = match self.extensions.entry(extension) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) if room => entry.insert(CategoryMetric::default()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                drop(entry);
+                self.extensions.entry("<other>".to_string()).or_default()
+            }
         };
-        let extension_metric = self.extensions.entry(key).or_default();
         Self::add_metric(extension_metric, logical, physical, private, text_like);
     }
 
@@ -201,12 +206,15 @@ impl CategoryTotals {
             self.values[index].small_text = self.values[index].small_text.saturating_add(other.values[index].small_text);
         }
         for (extension, values) in other.extensions {
-            let key = if self.extensions.contains_key(&extension) || self.extensions.len() < MAX_EXTENSION_KEYS {
-                extension
-            } else {
-                "<other>".to_string()
+            let room = self.extensions.len() < MAX_EXTENSION_KEYS;
+            let metric = match self.extensions.entry(extension) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) if room => entry.insert(CategoryMetric::default()),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    drop(entry);
+                    self.extensions.entry("<other>".to_string()).or_default()
+                }
             };
-            let metric = self.extensions.entry(key).or_default();
             metric.logical = metric.logical.saturating_add(values.logical);
             metric.physical = metric.physical.saturating_add(values.physical);
             metric.private = metric.private.saturating_add(values.private);
@@ -521,23 +529,6 @@ struct NativeEntry {
     name: [u8; NATIVE_NAME_CAPACITY],
 }
 
-impl Default for NativeEntry {
-    fn default() -> Self {
-        Self {
-            file_id: 0,
-            logical_size: 0,
-            allocated_size: 0,
-            private_size: 0,
-            device_id: 0,
-            link_count: 0,
-            object_type: 0,
-            error_code: 0,
-            name_length: 0,
-            name: [0; NATIVE_NAME_CAPACITY],
-        }
-    }
-}
-
 unsafe extern "C" {
     fn ds_scanner_create() -> *mut c_void;
     fn ds_recommended_fd_queue_limit() -> usize;
@@ -642,31 +633,40 @@ fn telemetry_totals(values: &[WorkerTelemetry]) -> (u64, u64, u64) {
     })
 }
 
-fn lower_name(value: &OsStr) -> String {
-    value.to_string_lossy().to_ascii_lowercase()
+fn lower_name<'a>(value: &'a OsStr) -> Cow<'a, str> {
+    let value = value.to_string_lossy();
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(value.to_ascii_lowercase())
+    } else {
+        value
+    }
 }
 
 fn derive_context(parent: u32, name: &OsStr) -> u32 {
     let value = lower_name(name);
+    derive_context_lower(parent, &value)
+}
+
+fn derive_context_lower(parent: u32, value: &Cow<'_, str>) -> u32 {
     let mut context = parent;
 
     if value.contains("whatsapp") { context |= CTX_WHATSAPP; }
     if context & CTX_WHATSAPP != 0 && value == "media" { context |= CTX_MESSAGE_MEDIA; }
 
-    if matches!(value.as_str(), "huggingface" | "transformers" | "diffusers" | "ollama" | "lm-studio" | "models" | "model" | "checkpoints") {
+    if matches!(value.as_ref(), "huggingface" | "transformers" | "diffusers" | "ollama" | "lm-studio" | "models" | "model" | "checkpoints") {
         context |= CTX_AI;
     }
-    if matches!(value.as_str(), ".venv" | "venv" | "virtualenv" | "site-packages" | "__pycache__" | ".tox" | ".nox") {
+    if matches!(value.as_ref(), ".venv" | "venv" | "virtualenv" | "site-packages" | "__pycache__" | ".tox" | ".nox") {
         context |= CTX_PYTHON_DEPS;
     }
-    if matches!(value.as_str(), ".conda" | "conda" | "conda3" | "miniconda" | "miniconda3" | "anaconda" | "anaconda3") {
+    if matches!(value.as_ref(), ".conda" | "conda" | "conda3" | "miniconda" | "miniconda3" | "anaconda" | "anaconda3") {
         context |= CTX_CONDA | CTX_PYTHON_DEPS;
     }
     if value == "node_modules" { context |= CTX_JS_DEPS; }
-    if matches!(value.as_str(), ".npm" | ".pnpm-store" | "pnpm" | "yarn" | "pip" | "cocoapods" | "homebrew" | "archive-v0" | "wheels-v5" | "simple-v18") {
+    if matches!(value.as_ref(), ".npm" | ".pnpm-store" | "pnpm" | "yarn" | "pip" | "cocoapods" | "homebrew" | "archive-v0" | "wheels-v5" | "simple-v18") {
         context |= CTX_PACKAGE_CACHE;
     }
-    if matches!(value.as_str(), "deriveddata" | "coresimulator" | "device support" | "ios devicesupport" | "archives") || value.ends_with(".xcarchive") || value.ends_with(".dsym") {
+    if matches!(value.as_ref(), "deriveddata" | "coresimulator" | "device support" | "ios devicesupport" | "archives") || value.ends_with(".xcarchive") || value.ends_with(".dsym") {
         context |= CTX_XCODE;
     }
     if value.contains("docker") || value.contains("colima") || value == "lima" || value == "_lima" {
@@ -675,59 +675,59 @@ fn derive_context(parent: u32, name: &OsStr) -> u32 {
     if value == ".git" || value == "objects" && parent & CTX_GIT != 0 || value == "lfs" && parent & CTX_GIT != 0 {
         context |= CTX_GIT;
     }
-    if matches!(value.as_str(), "build" | "dist" | "target" | ".next" | ".turbo" | ".gradle" | ".m2" | "bazel-out" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache") {
+    if matches!(value.as_ref(), "build" | "dist" | "target" | ".next" | ".turbo" | ".gradle" | ".m2" | "bazel-out" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache") {
         context |= CTX_BUILD;
     }
-    if matches!(value.as_str(), "cursor" | "chrome" | "chromium" | "code cache" | "gpucache" | "cacheddata" | "service worker" | "indexeddb" | "webstorage") {
+    if matches!(value.as_ref(), "cursor" | "chrome" | "chromium" | "code cache" | "gpucache" | "cacheddata" | "service worker" | "indexeddb" | "webstorage") {
         context |= CTX_BROWSER;
     }
-    if matches!(value.as_str(), "logs" | "diagnosticreports" | "crashpad" | "crashes") {
+    if matches!(value.as_ref(), "logs" | "diagnosticreports" | "crashpad" | "crashes") {
         context |= CTX_LOGS;
     }
-    if matches!(value.as_str(), ".cargo" | "cargo" | "rustup" | ".rustup" | "target")
-        || parent & CTX_RUST != 0 && matches!(value.as_str(), "registry" | "git" | "target")
+    if matches!(value.as_ref(), ".cargo" | "cargo" | "rustup" | ".rustup" | "target")
+        || parent & CTX_RUST != 0 && matches!(value.as_ref(), "registry" | "git" | "target")
     {
         context |= CTX_RUST;
     }
-    if matches!(value.as_str(), ".gradle" | "gradle" | ".m2" | "maven" | ".ivy2" | "ivy2")
-        || parent & CTX_JVM != 0 && matches!(value.as_str(), "caches" | "repository" | "wrapper")
+    if matches!(value.as_ref(), ".gradle" | "gradle" | ".m2" | "maven" | ".ivy2" | "ivy2")
+        || parent & CTX_JVM != 0 && matches!(value.as_ref(), "caches" | "repository" | "wrapper")
     {
         context |= CTX_JVM;
     }
-    if matches!(value.as_str(), "go-build" | "gomodcache" | "gopath")
-        || parent & CTX_GO != 0 && matches!(value.as_str(), "pkg" | "mod")
+    if matches!(value.as_ref(), "go-build" | "gomodcache" | "gopath")
+        || parent & CTX_GO != 0 && matches!(value.as_ref(), "pkg" | "mod")
     {
         context |= CTX_GO;
     }
-    if matches!(value.as_str(), ".nuget" | "nuget")
-        || parent & CTX_DOTNET != 0 && matches!(value.as_str(), "packages" | "bin" | "obj")
+    if matches!(value.as_ref(), ".nuget" | "nuget")
+        || parent & CTX_DOTNET != 0 && matches!(value.as_ref(), "packages" | "bin" | "obj")
     {
         context |= CTX_DOTNET;
     }
-    if matches!(value.as_str(), ".bundle" | "gems" | "rubies" | ".composer" | "composer")
+    if matches!(value.as_ref(), ".bundle" | "gems" | "rubies" | ".composer" | "composer")
         || parent & CTX_RUBY_PHP != 0 && value == "vendor"
     {
         context |= CTX_RUBY_PHP;
     }
-    if matches!(value.as_str(), ".android" | "android" | "android sdk" | "androidstudio" | "avd")
+    if matches!(value.as_ref(), ".android" | "android" | "android sdk" | "androidstudio" | "avd")
         || value.ends_with(".avd")
     {
         context |= CTX_ANDROID;
     }
-    if matches!(value.as_str(), "cmakefiles" | ".conan" | "conan" | ".vcpkg" | "vcpkg") {
+    if matches!(value.as_ref(), "cmakefiles" | ".conan" | "conan" | ".vcpkg" | "vcpkg") {
         context |= CTX_NATIVE;
     }
-    if matches!(value.as_str(), "unity" | "unrealengine" | "unreal engine" | "deriveddatacache")
+    if matches!(value.as_ref(), "unity" | "unrealengine" | "unreal engine" | "deriveddatacache")
         || value.ends_with(".uproject") || value.ends_with(".unitypackage")
     {
         context |= CTX_GAME;
     }
-    if matches!(value.as_str(), "final cut backups.localized" | "motion templates.localized" | "adobe" | "premiere pro" | "after effects" | "davinci resolve" | "render cache" | "optimized media" | "proxy media" | "blender")
+    if matches!(value.as_ref(), "final cut backups.localized" | "motion templates.localized" | "adobe" | "premiere pro" | "after effects" | "davinci resolve" | "render cache" | "optimized media" | "proxy media" | "blender")
         || value.ends_with(".fcpbundle") || value.ends_with(".fcpproject") || value.ends_with(".drp")
     {
         context |= CTX_MEDIA_PRODUCTION;
     }
-    if matches!(value.as_str(), ".terraform" | ".terragrunt-cache" | "terraform.d" | ".pulumi" | "pulumi" | ".serverless" | ".aws-sam" | "cdk.out") {
+    if matches!(value.as_ref(), ".terraform" | ".terragrunt-cache" | "terraform.d" | ".pulumi" | "pulumi" | ".serverless" | ".aws-sam" | "cdk.out") {
         context |= CTX_INFRA;
     }
     context
@@ -736,12 +736,11 @@ fn derive_context(parent: u32, name: &OsStr) -> u32 {
 fn extension(name: &OsStr) -> String {
     Path::new(name)
         .extension()
-        .map(lower_name)
+        .map(|value| lower_name(value).into_owned())
         .unwrap_or_default()
 }
 
-fn dynamic_extension(name: &OsStr) -> String {
-    let value = extension(name);
+fn dynamic_extension(value: &str) -> String {
     if value.is_empty() { return "<none>".to_string(); }
     if value.len() > 64 { return "<long-or-nonstandard>".to_string(); }
     value
@@ -750,9 +749,7 @@ fn dynamic_extension(name: &OsStr) -> String {
         .collect()
 }
 
-fn classify_file(context: u32, name: &OsStr) -> (usize, bool) {
-    let file_name = lower_name(name);
-    let ext = extension(name);
+fn classify_file(context: u32, file_name: &Cow<'_, str>, ext: &String) -> (usize, bool) {
 
     if context & CTX_MESSAGE_MEDIA != 0 { return (MESSAGE_MEDIA, false); }
     if matches!(ext.as_str(), "safetensors" | "gguf" | "ggml" | "onnx" | "tflite" | "mlmodel" | "mlpackage" | "pt" | "pth" | "ckpt" | "coreml" | "engine" | "weights" | "params")
@@ -786,16 +783,16 @@ fn classify_file(context: u32, name: &OsStr) -> (usize, bool) {
     if matches!(ext.as_str(), "pyc" | "pyo" | "pyd" | "whl" | "egg") { return (PYTHON_DEPS, false); }
     if matches!(ext.as_str(), "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "vue" | "svelte") { return (JS_SOURCE, true); }
     if matches!(ext.as_str(), "swift" | "m" | "mm" | "xib" | "storyboard" | "xcconfig" | "pbxproj" | "entitlements") { return (IOS_SOURCE, true); }
-    if ext == "rs" || matches!(file_name.as_str(), "cargo.toml" | "cargo.lock") || matches!(ext.as_str(), "rlib" | "rmeta") { return (RUST_CARGO, ext == "rs" || file_name == "cargo.toml"); }
-    if matches!(ext.as_str(), "java" | "kt" | "kts" | "scala" | "class" | "jar" | "war") || matches!(file_name.as_str(), "pom.xml" | "build.gradle" | "build.gradle.kts") { return (JVM_BUILD, matches!(ext.as_str(), "java" | "kt" | "kts" | "scala")); }
-    if ext == "go" || matches!(file_name.as_str(), "go.mod" | "go.sum" | "go.work") { return (GO_BUILD, true); }
-    if matches!(ext.as_str(), "cs" | "fs" | "fsx" | "vb" | "dll" | "pdb" | "nupkg") || matches!(file_name.as_str(), "packages.lock.json" | "global.json") { return (DOTNET_BUILD, matches!(ext.as_str(), "cs" | "fs" | "fsx" | "vb")); }
-    if matches!(ext.as_str(), "rb" | "gem" | "php" | "phar") || matches!(file_name.as_str(), "gemfile" | "gemfile.lock" | "composer.json" | "composer.lock") { return (RUBY_PHP, matches!(ext.as_str(), "rb" | "php")); }
+    if ext == "rs" || matches!(file_name.as_ref(), "cargo.toml" | "cargo.lock") || matches!(ext.as_str(), "rlib" | "rmeta") { return (RUST_CARGO, ext == "rs" || file_name == "cargo.toml"); }
+    if matches!(ext.as_str(), "java" | "kt" | "kts" | "scala" | "class" | "jar" | "war") || matches!(file_name.as_ref(), "pom.xml" | "build.gradle" | "build.gradle.kts") { return (JVM_BUILD, matches!(ext.as_str(), "java" | "kt" | "kts" | "scala")); }
+    if ext == "go" || matches!(file_name.as_ref(), "go.mod" | "go.sum" | "go.work") { return (GO_BUILD, true); }
+    if matches!(ext.as_str(), "cs" | "fs" | "fsx" | "vb" | "dll" | "pdb" | "nupkg") || matches!(file_name.as_ref(), "packages.lock.json" | "global.json") { return (DOTNET_BUILD, matches!(ext.as_str(), "cs" | "fs" | "fsx" | "vb")); }
+    if matches!(ext.as_str(), "rb" | "gem" | "php" | "phar") || matches!(file_name.as_ref(), "gemfile" | "gemfile.lock" | "composer.json" | "composer.lock") { return (RUBY_PHP, matches!(ext.as_str(), "rb" | "php")); }
     if matches!(ext.as_str(), "apk" | "aab" | "aar" | "dex") || file_name == "androidmanifest.xml" { return (ANDROID_BUILD, false); }
     if matches!(ext.as_str(), "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" | "cmake") || file_name == "cmakelists.txt" { return (NATIVE_CPP, true); }
     if matches!(ext.as_str(), "uasset" | "umap" | "unity" | "prefab" | "asset" | "fbx" | "obj" | "glb" | "gltf") { return (GAME_ENGINE, false); }
     if matches!(ext.as_str(), "fcpbundle" | "fcpproject" | "prproj" | "aep" | "aepx" | "drp" | "dra" | "blend" | "braw" | "r3d" | "mxf" | "exr" | "dpx" | "psd" | "ai") { return (MEDIA_PRODUCTION, false); }
-    if matches!(ext.as_str(), "tf" | "tfvars" | "hcl") || matches!(file_name.as_str(), "pulumi.yaml" | "serverless.yml" | "template.yaml") { return (INFRA_CLOUD, true); }
+    if matches!(ext.as_str(), "tf" | "tfvars" | "hcl") || matches!(file_name.as_ref(), "pulumi.yaml" | "serverless.yml" | "template.yaml") { return (INFRA_CLOUD, true); }
     if context & CTX_BUILD != 0 || matches!(ext.as_str(), "o" | "a" | "dylib" | "class" | "jar" | "wasm" | "map") { return (BUILD_ARTIFACT, false); }
     if matches!(ext.as_str(), "db" | "sqlite" | "sqlite3" | "wal" | "shm" | "ldb" | "mdb" | "index" | "idx") || file_name.contains("leveldb") { return (DATABASE_INDEX, false); }
     if matches!(ext.as_str(), "log" | "crash" | "trace" | "ips" | "diag" | "xcresult") { return (LOG_CRASH, true); }
@@ -813,26 +810,23 @@ fn generated_context(context: u32) -> bool {
     context & (CTX_AI | CTX_PYTHON_DEPS | CTX_JS_DEPS | CTX_PACKAGE_CACHE | CTX_XCODE | CTX_DOCKER | CTX_GIT | CTX_BUILD | CTX_BROWSER | CTX_LOGS | CTX_RUST | CTX_JVM | CTX_GO | CTX_DOTNET | CTX_RUBY_PHP | CTX_ANDROID | CTX_NATIVE | CTX_INFRA) != 0
 }
 
-fn activity_timestamp_needed(context: u32, name: &OsStr, version_candidate: bool) -> bool {
-    let lower = lower_name(name);
-    if version_candidate || project_marker_kind(name).is_some() || matches!(lower.as_str(), "pyvenv.cfg" | "conda-meta") {
+fn activity_timestamp_needed(context: u32, lower: &str, version_candidate: bool, classification: (usize, bool)) -> bool {
+    if version_candidate || project_marker_kind_lower(lower).is_some() || matches!(lower, "pyvenv.cfg" | "conda-meta") {
         return true;
     }
     if generated_context(context) || context & CTX_PROJECT_TREE == 0 { return false; }
-    let (category, text_like) = classify_file(context, name);
+    let (category, text_like) = classification;
     text_like || matches!(category, OTHER_MEDIA | MEDIA_PRODUCTION | IOS_SOURCE | GAME_ENGINE)
 }
 
-fn source_activity_candidate(context: u32, name: &OsStr) -> bool {
+fn source_activity_candidate(context: u32, classification: (usize, bool)) -> bool {
     if generated_context(context) { return false; }
-    let (category, text_like) = classify_file(context, name);
+    let (category, text_like) = classification;
     text_like || matches!(category, OTHER_MEDIA | MEDIA_PRODUCTION | IOS_SOURCE | GAME_ENGINE)
 }
 
-fn version_cluster_key(name: &OsStr) -> Option<(String, i32, bool)> {
-    let lower = lower_name(name);
-    let extension = extension(name);
-    let mut stem = Path::new(&lower).file_stem()?.to_string_lossy().to_string();
+fn version_cluster_key(lower: &str, extension: &str) -> Option<(String, i32, bool)> {
+    let mut stem = Path::new(lower).file_stem()?.to_string_lossy().to_string();
     let mut rank = 0i32;
     let mut signalled = false;
 
@@ -878,25 +872,29 @@ fn version_cluster_key(name: &OsStr) -> Option<(String, i32, bool)> {
         }
     }
     if !signalled {
-        let compact = stem.to_ascii_lowercase();
+        let compact = stem.as_str();
         if let Some(position) = compact.rfind("version") {
             let suffix = compact[position + "version".len()..].trim();
-            if suffix.parse::<u16>().ok().filter(|value| *value <= 999).is_some() {
-                stem = stem[..position].trim_end_matches([' ', '_', '-']).to_string();
-                rank = suffix.parse::<i32>().unwrap_or(1);
+            if let Some(parsed_rank) = suffix.parse::<u16>().ok().filter(|value| *value <= 999) {
+                let new_stem = stem[..position].trim_end_matches([' ', '_', '-']).to_string();
+                stem = new_stem;
+                rank = parsed_rank as i32;
                 signalled = true;
             }
         }
     }
     if !signalled {
-        let compact = stem.to_ascii_lowercase();
+        let compact = stem.as_str();
         if let Some(position) = compact.rfind('v') {
             let suffix = compact[position + 1..].trim();
             let separated = position == 0 || matches!(compact.as_bytes()[position - 1], b' ' | b'_' | b'-');
-            if separated && suffix.parse::<u16>().ok().filter(|value| *value <= 999).is_some() {
-                stem = stem[..position].trim_end_matches([' ', '_', '-']).to_string();
-                rank = suffix.parse::<i32>().unwrap_or(1);
-                signalled = true;
+            if separated {
+                if let Some(parsed_rank) = suffix.parse::<u16>().ok().filter(|value| *value <= 999) {
+                    let new_stem = stem[..position].trim_end_matches([' ', '_', '-']).to_string();
+                    stem = new_stem;
+                    rank = parsed_rank as i32;
+                    signalled = true;
+                }
             }
         }
     }
@@ -905,11 +903,25 @@ fn version_cluster_key(name: &OsStr) -> Option<(String, i32, bool)> {
     Some((key, rank, signalled))
 }
 
-fn version_candidate_allowed(context: u32, name: &OsStr, signalled: bool) -> bool {
+fn likely_version_name(lower: &str) -> bool {
+    lower.bytes().any(|value| value.is_ascii_digit())
+        || lower.contains('(')
+        || lower.contains(" copy")
+        || lower.contains(" duplicate")
+        || lower.contains(" version")
+        || lower.contains(" export")
+        || lower.contains(" backup")
+        || lower.contains(" edited")
+        || lower.contains(" final")
+        || lower.contains(" old")
+        || lower.contains(" new")
+        || lower.contains(" v")
+}
+
+fn version_candidate_allowed(context: u32, ext: &str, signalled: bool) -> bool {
     if signalled { return true; }
-    let ext = extension(name);
     context & (CTX_XCODE | CTX_BUILD | CTX_MEDIA_PRODUCTION | CTX_MESSAGE_MEDIA) != 0
-        || matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "tiff" | "svg" | "mp4" | "mov" | "mkv" | "avi" | "webm" | "mp3" | "wav" | "m4a" | "flac" | "aac" | "pdf" | "zip" | "tar" | "gz" | "dmg" | "pkg" | "ipa" | "iso" | "app")
+        || matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "tiff" | "svg" | "mp4" | "mov" | "mkv" | "avi" | "webm" | "mp3" | "wav" | "m4a" | "flac" | "aac" | "pdf" | "zip" | "tar" | "gz" | "dmg" | "pkg" | "ipa" | "iso" | "app")
 }
 
 fn maybe_collect_version_candidate(
@@ -917,7 +929,8 @@ fn maybe_collect_version_candidate(
     candidate_count: &mut u64,
     skipped_count: &mut u64,
     context: u32,
-    name: &OsStr,
+    version_info: Option<(String, i32, bool)>,
+    extension: &str,
     path: PathBuf,
     logical: u64,
     physical: u64,
@@ -925,11 +938,11 @@ fn maybe_collect_version_candidate(
     created_seconds: u64,
     modified_seconds: u64,
 ) {
-    let (key, version_rank, signalled) = match version_cluster_key(name) {
+    let (key, version_rank, signalled) = match version_info {
         Some(value) => value,
         None => return,
     };
-    if !version_candidate_allowed(context, name, signalled) { return; }
+    if !version_candidate_allowed(context, extension, signalled) { return; }
     let is_new_key = !groups.contains_key(&key);
     if is_new_key && groups.len() >= VERSION_INDEX_LIMIT_PER_DIRECTORY {
         *skipped_count += 1;
@@ -992,16 +1005,15 @@ fn finalize_version_groups(groups: HashMap<String, Vec<VersionCandidate>>) -> (V
     (clusters, count)
 }
 
-fn project_marker_kind(name: &OsStr) -> Option<&'static str> {
-    let value = lower_name(name);
+fn project_marker_kind_lower(value: &str) -> Option<&'static str> {
     if value == ".git" { Some("git_project") }
-    else if matches!(value.as_str(), "pyproject.toml" | "setup.py" | "requirements.txt" | "environment.yml" | "environment.yaml") { Some("python_project") }
-    else if matches!(value.as_str(), "package.json" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock") { Some("javascript_project") }
+    else if matches!(value, "pyproject.toml" | "setup.py" | "requirements.txt" | "environment.yml" | "environment.yaml") { Some("python_project") }
+    else if matches!(value, "package.json" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock") { Some("javascript_project") }
     else if value == "cargo.toml" { Some("rust_project") }
-    else if matches!(value.as_str(), "go.mod" | "go.work") { Some("go_project") }
+    else if matches!(value, "go.mod" | "go.work") { Some("go_project") }
     else if value.ends_with(".xcodeproj") || value.ends_with(".xcworkspace") || value == "podfile" { Some("ios_project") }
-    else if matches!(value.as_str(), "dockerfile" | "docker-compose.yml" | "docker-compose.yaml" | "compose.yml" | "compose.yaml") { Some("docker_project") }
-    else if matches!(value.as_str(), "pom.xml" | "build.gradle" | "build.gradle.kts") { Some("jvm_project") }
+    else if matches!(value, "dockerfile" | "docker-compose.yml" | "docker-compose.yaml" | "compose.yml" | "compose.yaml") { Some("docker_project") }
+    else if matches!(value, "pom.xml" | "build.gradle" | "build.gradle.kts") { Some("jvm_project") }
     else if value == "composer.json" || value == "gemfile" { Some("ruby_php_project") }
     else { None }
 }
@@ -1200,7 +1212,7 @@ fn inspect_git_evidence(root: &Path) -> Option<GitEvidence> {
 fn environment_kind_for_child(parent_name: &OsStr, child_name: &OsStr, parent_context: u32) -> Option<&'static str> {
     let child = lower_name(child_name);
     let parent = lower_name(parent_name);
-    if matches!(child.as_str(), ".venv" | "venv" | "virtualenv" | ".python") { return Some("python_venv"); }
+    if matches!(child.as_ref(), ".venv" | "venv" | "virtualenv" | ".python") { return Some("python_venv"); }
     if parent == "envs" && parent_context & CTX_CONDA != 0 { return Some("conda_env"); }
     None
 }
@@ -1214,7 +1226,8 @@ fn add_file_metrics(
     categories: &mut CategoryTotals,
     hardlinks: &HardlinkSet,
     context: u32,
-    name: &OsStr,
+    extension: &str,
+    classification: (usize, bool),
     device: u64,
     file_id: u64,
     link_count: u32,
@@ -1223,7 +1236,7 @@ fn add_file_metrics(
     private: u64,
     modified_seconds: u64,
 ) {
-    let (category, text_like) = classify_file(context, name);
+    let (category, text_like) = classification;
     let first_link = hardlinks.is_first_parts(device, file_id, link_count);
     let logical_for_space = if first_link { logical } else { 0 };
     let physical_for_space = if first_link { physical } else { 0 };
@@ -1247,7 +1260,7 @@ fn add_file_metrics(
     direct.newest_modified_seconds = direct.newest_modified_seconds.max(modified_seconds);
     categories.add_file(
         category,
-        dynamic_extension(name),
+        dynamic_extension(extension),
         logical_for_space,
         physical_for_space,
         private_for_space,
@@ -1287,8 +1300,8 @@ fn scan_directory_native(
     if !opened { return None; }
 
     loop {
-        let mut entry = NativeEntry::default();
-        let result = unsafe { ds_next_entry(scanner.handle, &mut entry) };
+        let mut entry = MaybeUninit::<NativeEntry>::uninit();
+        let result = unsafe { ds_next_entry(scanner.handle, entry.as_mut_ptr()) };
         if result == 0 { break; }
         if result < 0 {
             let error_code = unsafe { ds_last_errno(scanner.handle) };
@@ -1296,10 +1309,12 @@ fn scan_directory_native(
             complete = false;
             break;
         }
+        // The C shim zeroes and fully populates NativeEntry before returning > 0.
+        let entry = unsafe { entry.assume_init() };
         entries_seen += 1;
 
         let name_length = (entry.name_length as usize).min(NATIVE_NAME_CAPACITY);
-        let name = OsString::from_vec(entry.name[..name_length].to_vec());
+        let name = OsStr::from_bytes(&entry.name[..name_length]);
         if name.is_empty() || name == OsStr::new(".") || name == OsStr::new("..") { continue; }
         if entry.error_code != 0 {
             errors.push((task.path.join(&name), format!("entry_error={}", entry.error_code)));
@@ -1311,18 +1326,30 @@ fn scan_directory_native(
             continue;
         }
 
-        project_kind = merge_project_kind(project_kind, project_marker_kind(&name));
         let lower_entry_name = lower_name(&name);
+        project_kind = merge_project_kind(project_kind, project_marker_kind_lower(lower_entry_name.as_ref()));
         if lower_entry_name == ".git" { git_marker = true; }
         if lower_entry_name == "pyvenv.cfg" { environment_kind = Some("python_venv"); }
         if lower_entry_name == "conda-meta" { environment_kind = Some("conda_env"); }
-        let entry_context = if entry.object_type == VDIR { derive_context(task.context, &name) } else { task.context };
-        let version_info = version_cluster_key(&name);
-        let version_candidate = version_candidate_allowed(entry_context, &name, version_info.as_ref().map(|value| value.2).unwrap_or(false));
-        if !version_candidate && task.context & CTX_PROJECT_TREE == 0 && entry.object_type == VREG && source_activity_candidate(entry_context, &name) && deferred_activity_candidates.len() < 100_000 {
-            deferred_activity_candidates.push(name.clone());
+        let extension = extension(&name);
+        let entry_context = if entry.object_type == VDIR { derive_context_lower(task.context, &lower_entry_name) } else { task.context };
+        let classification = if entry.object_type == VREG {
+            classify_file(task.context, &lower_entry_name, &extension)
+        } else {
+            (OTHER, false)
+        };
+        let version_info = if likely_version_name(lower_entry_name.as_ref())
+            || version_candidate_allowed(entry_context, &extension, false)
+        {
+            version_cluster_key(lower_entry_name.as_ref(), &extension)
+        } else {
+            None
+        };
+        let version_candidate = version_candidate_allowed(entry_context, &extension, version_info.as_ref().map(|value| value.2).unwrap_or(false));
+        if !version_candidate && task.context & CTX_PROJECT_TREE == 0 && entry.object_type == VREG && source_activity_candidate(task.context, classification) && deferred_activity_candidates.len() < 100_000 {
+            deferred_activity_candidates.push(name.to_os_string());
         }
-        let (created_seconds, modified_seconds) = if activity_timestamp_needed(entry_context, &name, version_candidate) {
+        let (created_seconds, modified_seconds) = if activity_timestamp_needed(entry_context, lower_entry_name.as_ref(), version_candidate, classification) {
             timestamp_queries += 1;
             match scanner.child_times(&name) {
                 Some(value) => value,
@@ -1337,7 +1364,8 @@ fn scan_directory_native(
                 &mut version_candidates,
                 &mut version_candidates_skipped,
                 entry_context,
-                &name,
+                version_info,
+                &extension,
                 task.path.join(&name),
                 entry.logical_size,
                 entry.allocated_size,
@@ -1379,7 +1407,8 @@ fn scan_directory_native(
                 categories,
                 hardlinks,
                 task.context,
-                &name,
+                &extension,
+                classification,
                 entry.device_id,
                 entry.file_id,
                 entry.link_count,
@@ -1446,18 +1475,27 @@ fn scan_directory_fallback(
                 if metadata.dev() != root_device { mounts_skipped += 1; continue; }
 
                 let name = entry.file_name();
-                project_kind = merge_project_kind(project_kind, project_marker_kind(&name));
                 let lower_entry_name = lower_name(&name);
+                project_kind = merge_project_kind(project_kind, project_marker_kind_lower(lower_entry_name.as_ref()));
                 if lower_entry_name == ".git" { git_marker = true; }
                 if lower_entry_name == "pyvenv.cfg" { environment_kind = Some("python_venv"); }
                 if lower_entry_name == "conda-meta" { environment_kind = Some("conda_env"); }
+                let extension = extension(&name);
+                let classification = classify_file(task.context, &lower_entry_name, &extension);
+                let version_info = if likely_version_name(lower_entry_name.as_ref())
+                    || version_candidate_allowed(task.context, &extension, false)
+                {
+                    version_cluster_key(lower_entry_name.as_ref(), &extension)
+                } else {
+                    None
+                };
 
                 if file_type.is_dir() {
-                    let context = derive_context(task.context, &name);
+                    let context = derive_context_lower(task.context, &lower_entry_name);
                     let created_seconds = metadata.created().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     let modified_seconds = metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     timestamp_queries += 1;
-                    maybe_collect_version_candidate(&mut version_groups, &mut version_candidates, &mut version_candidates_skipped, context, &name, path.clone(), metadata.len(), allocated(&metadata), 0, created_seconds, modified_seconds);
+                    maybe_collect_version_candidate(&mut version_groups, &mut version_candidates, &mut version_candidates_skipped, context, version_info, &extension, path.clone(), metadata.len(), allocated(&metadata), 0, created_seconds, modified_seconds);
                     if children.len() >= MAX_CHILDREN_PER_DIRECTORY {
                         errors.push((task.path.clone(), "children_limit_exceeded".to_string()));
                         complete = false;
@@ -1468,13 +1506,14 @@ fn scan_directory_fallback(
                     let modified_seconds = metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     let created_seconds = metadata.created().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
                     timestamp_queries += 1;
-                    maybe_collect_version_candidate(&mut version_groups, &mut version_candidates, &mut version_candidates_skipped, task.context, &name, path, metadata.len(), allocated(&metadata), 0, created_seconds, modified_seconds);
+                    maybe_collect_version_candidate(&mut version_groups, &mut version_candidates, &mut version_candidates_skipped, task.context, version_info, &extension, path, metadata.len(), allocated(&metadata), 0, created_seconds, modified_seconds);
                     add_file_metrics(
                         &mut direct,
                         categories,
                         hardlinks,
                         task.context,
-                        &name,
+                        &extension,
+                        classification,
                         metadata.dev(),
                         metadata.ino(),
                         metadata.nlink() as u32,
