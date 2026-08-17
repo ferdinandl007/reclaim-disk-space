@@ -1,27 +1,94 @@
 # Reclaim Disk Space
 
-[![macOS CI](https://github.com/ferdinandl007/reclaim-disk-space/actions/workflows/ci.yml/badge.svg)](https://github.com/ferdinandl007/reclaim-disk-space/actions/workflows/ci.yml)
-[![Latest Release](https://img.shields.io/github/v/release/ferdinandl007/reclaim-disk-space?display_name=tag&style=flat-square)](https://github.com/ferdinandl007/reclaim-disk-space/releases)
+<p align="center">
+  <img src="assets/disk-radar.svg" alt="A disk radar for agents: APFS truth, tiny-file pressure, and stack-aware cleanup" width="100%">
+</p>
 
-Native, evidence-first disk auditing and guarded cleanup for macOS developer, AI, iOS, container, and media workstations.
+<p align="center">
+  <strong>Give your agent a disk radar.</strong><br>
+  Native macOS storage intelligence for the files that normal disk tools miss.
+</p>
 
-Most disk tools answer only “which files are large?” This project also answers:
+<p align="center">
+  <a href="https://github.com/ferdinandl007/reclaim-disk-space/releases"><img src="https://img.shields.io/github/v/release/ferdinandl007/reclaim-disk-space?display_name=tag&style=for-the-badge&color=f37b46" alt="Latest release"></a>
+  <a href="https://github.com/ferdinandl007/reclaim-disk-space/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ferdinandl007/reclaim-disk-space/ci.yml?style=for-the-badge&label=build" alt="Build status"></a>
+  <a href="https://github.com/ferdinandl007/reclaim-disk-space/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ferdinandl007/reclaim-disk-space?style=for-the-badge&color=21d4c2" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-21d4c2?style=for-the-badge&logo=apple&logoColor=white" alt="macOS Apple Silicon">
+  <img src="https://img.shields.io/badge/agent--ready-Codex%20%7C%20Claude%20Code%20%7C%20Gemini%20CLI%20%7C%20Cursor-f37b46?style=for-the-badge" alt="Agent ready">
+</p>
 
-- What is actually allocated on APFS versus merely logical or clone-attributed?
-- Which directories contain millions of tiny files or small text files?
-- Which storage belongs to Xcode, simulators, Docker, Colima, Python, JavaScript, Rust, AI models, media, or other development stacks?
-- What can be regenerated safely, and what is application state or user data?
-- How can a cleanup agent delete only an explicitly confirmed canonical path?
+<p align="center">
+  <a href="https://github.com/ferdinandl007/reclaim-disk-space/releases/tag/v0.1.0">Download the arm64 release</a> ·
+  <a href="#run-it-with-an-agent">Run it with an agent</a> ·
+  <a href="#safety-contract">Read the safety contract</a>
+</p>
 
-The scanner is written in Rust with a small macOS C shim using `getattrlistbulk`. It uses adaptive directory-level concurrency, hard-link deduplication, compact aggregation, dynamic extension accounting, and a self-monitoring interactive mode. The guarded cleaner enumerates once, refuses dangerous roots and cross-filesystem traversal, requires exact-path confirmation, and reports live progress.
+> Your Mac is not “mysteriously full.” It is usually hiding clones, sparse VM disks, millions of tiny files, model caches, simulator state, editor databases, and build products behind one misleading number. Reclaim Disk Space gives an agent the evidence to tell the difference.
 
-## Safety first
+## The one-minute agent loop
 
-Scanning is read-only. Cleanup is deliberately separate.
+```text
+discover → explain → propose exact paths → confirm → clean → verify
+```
 
-The cleaner will not accept `/`, `/System/Volumes/Data`, a home directory, a relative path, or a root that crosses onto another filesystem. Execution requires the exact canonical path twice:
+This is not a blind “delete caches” script. It is a macOS-native scanner, an agent-readable skill, and a guarded deletion utility designed to keep destructive decisions visible.
+
+## Run it with an agent
+
+The skill is plain Markdown plus executable tools, so it travels well across agent runtimes. It is native in Codex and can be copied into compatible skill directories for Claude Code, Gemini CLI, Cursor, OpenCode, or a cloud agent running on the Mac whose storage is in scope.
+
+### Give your agent this prompt
+
+```text
+Use the reclaim-disk-space skill.
+
+Scan my Mac read-only first. Rank independent storage branches by APFS private bytes
+and allocated bytes, explain logical-size distortion, count tiny and small text files,
+classify developer/AI/media stacks dynamically, and report permission blind spots.
+
+Do not delete anything. After the report, propose exact canonical paths with risk,
+conservative reclaim, regeneration cost, and the owning app. Ask me to confirm exact
+paths before any cleanup.
+```
+
+### Install the skill in seconds
+
+On Apple Silicon, download the latest archive from [Releases](https://github.com/ferdinandl007/reclaim-disk-space/releases), extract it, and run the included installer:
 
 ```sh
+./install.sh
+```
+
+The release installs prebuilt arm64 tools and the Codex skill. No Rust compiler is required. For a local agent checkout:
+
+```sh
+mkdir -p "$HOME/.codex/skills"
+cp -R skills/reclaim-disk-space "$HOME/.codex/skills/reclaim-disk-space"
+```
+
+## Why agents care
+
+| Agent problem | What this project exposes |
+| --- | --- |
+| “The disk is full, but the largest files look normal.” | APFS `private`, `allocated`, and `logical` size side by side |
+| “The cache says 20 GB, but deleting it freed 2 GB.” | Clone, sparse-file, hard-link, and immediate-reclaim caveats |
+| “There are millions of files and every tool crawls.” | Tiny-file, small-file, and small-text hotspots |
+| “Classify everything with a brittle extension list.” | Dynamic extension accounting plus contextual stack categories |
+| “The user said clean it; what exactly is safe?” | Exact canonical paths, risk tiers, regeneration cost, and confirmation gates |
+| “The scan makes the Mac unusable.” | Adaptive workers, process CPU budget, host-load guard, and interactive backoff |
+
+## The safety contract
+
+### Scan first. Delete second.
+
+Scanning is read-only. Cleanup is a separate command and requires the exact canonical path twice. The cleaner refuses `/`, `/System/Volumes/Data`, home directories, relative paths, and cross-filesystem traversal.
+
+```sh
+# Read-only plan
+skills/reclaim-disk-space/scripts/run-disk-clean.sh \
+  --root "$HOME/Library/Developer/Xcode/DerivedData"
+
+# Execute only after reviewing and confirming that exact path
 skills/reclaim-disk-space/scripts/run-disk-clean.sh \
   --root "$HOME/Library/Developer/Xcode/DerivedData" \
   --execute \
@@ -30,98 +97,79 @@ skills/reclaim-disk-space/scripts/run-disk-clean.sh \
   --profile interactive
 ```
 
-Always run the read-only plan first and close the owning application. This tool cannot determine whether an application database, model, dataset, simulator, Docker volume, or project is personally important. Treat those as review candidates, not automatic cleanup.
+The agent must never turn “delete everything” into permission to erase projects, credentials, messages, photos, datasets, model checkpoints, databases, Docker volumes, or synchronized content.
 
-## Quick start
+## What the scanner sees
 
-### From a release (Apple Silicon)
-
-If you are on an Apple Silicon Mac, download the latest `macos-arm64.tar.gz` from [Releases](https://github.com/ferdinandl007/reclaim-disk-space/releases), unpack it, and run:
-
-```sh
-./install.sh
+```mermaid
+flowchart LR
+  A[macOS filesystem] --> B[getattrlistbulk]
+  B --> C[Rust aggregation]
+  C --> D[APFS accounting]
+  C --> E[Dynamic extensions]
+  C --> F[Stack context]
+  D --> G[Agent-readable TSV]
+  E --> G
+  F --> G
+  G --> H[Exact-path proposal]
+  H --> I{User confirms}
+  I -->|no| J[Stop safely]
+  I -->|yes| K[Guarded native cleanup]
+  K --> L[Free-space verification]
 ```
 
-This installs the prebuilt native tools and the Codex skill. It does not require a Rust compiler. The release is intentionally arm64-only; source builds remain available for development.
+The macOS C shim batches directory metadata through `getattrlistbulk`; Rust handles classification and aggregation without launching a subprocess per file. The same native metadata layer powers the scanner and cleaner.
 
-### From source
+## A report you can reason about
 
-Requirements:
+```text
+SUMMARY   private=...   allocated=...   logical=...
+          tiny=...     small=...      small_text=...
+          workers_best=...  peak_host_busy=...  permission_errors=...
 
-- macOS with Apple Command Line Tools (`clang`)
-- Rust compiler (`rustc`)
-- A local filesystem path you have permission to inspect
+CATEGORY  name=ai_model_weights          private=...
+CATEGORY  name=javascript_dependencies   private=...
+CATEGORY  name=xcode_simulators_builds   private=...
 
-Build the native tools:
+EXTENSION name=<none>       private=...
+EXTENSION name=safetensors  private=...
+EXTENSION name=sqlite       private=...
+
+TOP_PRIVATE       path=/Users/.../Library/Developer/CoreSimulator
+SMALL_TEXT_HOTSPOT path=/Users/.../.cache/.../metadata
+ERROR_PATH        path=/Users/.../Library/Mail reason=permission
+```
+
+The values above are illustrative. Reports are TSV so agents can parse them without a custom API, while humans can still inspect them in a terminal or spreadsheet.
+
+## Built for the real developer Mac
+
+- **AI:** Hugging Face, model servers, LM Studio, Ollama, PyTorch, Core ML, datasets, embeddings, checkpoints
+- **Apple:** Xcode DerivedData, archives, DeviceSupport, SwiftPM, CocoaPods, CoreSimulator devices and runtimes
+- **Containers:** Docker Desktop, Colima, Lima sparse disks, images, build cache, volumes, Kubernetes data
+- **Languages:** Python/uv/pip/Conda, JavaScript/npm/pnpm/Yarn/Bun, Rust/Cargo, Go, JVM/Gradle/Maven, .NET/NuGet, Ruby, PHP
+- **Native and media:** C/C++, CMake, Conan, vcpkg, Android, Blender, Final Cut, Premiere, Resolve, proxies, renders, thumbnails
+- **The unknown:** extensionless stores and new formats remain visible in the raw dynamic tables
+
+## Performance without the fan apocalypse
+
+Directory workers are discovered rather than hardcoded. Interactive mode starts conservatively, probes useful concurrency, monitors its own CPU and host load, and backs off when metadata latency or contention rises. The ceiling is derived from logical CPUs, memory, file descriptors, and a generous safety cap, so the same binary can adapt to a different Apple Silicon machine.
+
+GPU acceleration is intentionally not used: filesystem metadata enumeration is kernel/storage bound, while classification is cheap string matching. The useful acceleration is batched native metadata, bounded directory concurrency, hard-link deduplication, and fewer subprocesses.
+
+## Source build
+
+Requirements: Apple Command Line Tools (`clang`), Rust (`rustc`), and an Apple Silicon Mac.
 
 ```sh
 make build
-```
-
-Scan a focused area first:
-
-```sh
 make scan ROOT="$HOME/Library" OUT=/tmp/library-storage.tsv
-```
-
-For a system-wide report:
-
-```sh
-make scan ROOT=/System/Volumes/Data OUT=/tmp/data-volume-storage.tsv
-```
-
-Read the report as TSV. Important records include `SUMMARY`, `CATEGORY`, `EXTENSION`, `TOP_PRIVATE`, `TOP_ALLOCATED`, `TOP_LOGICAL`, `SMALL_TEXT_HOTSPOT`, and `ERROR_PATH`.
-
-Generate a deletion plan without changing anything:
-
-```sh
 make plan ROOT="$HOME/Library/Developer/Xcode/DerivedData"
 ```
 
-Execute only after reviewing and confirming that exact path:
+Generated binaries are ignored by Git. Tagged releases publish a prebuilt arm64 archive and SHA-256 checksums through [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
-```sh
-make delete CONFIRM="$HOME/Library/Developer/Xcode/DerivedData"
-```
-
-Use `PROFILE=max-throughput` only for an explicitly approved unattended run. `auto` is the responsive default and adapts its ceiling from hardware, file-descriptor limits, observed latency, process CPU, and host load.
-
-## Install the agent skill
-
-The repository includes a reusable Codex skill at `skills/reclaim-disk-space`. Install it into a local Codex skill directory:
-
-```sh
-mkdir -p "$HOME/.codex/skills"
-cp -R skills/reclaim-disk-space "$HOME/.codex/skills/reclaim-disk-space"
-```
-
-The skill teaches an agent how to scan first, interpret APFS allocation, classify common developer and AI stacks, identify inode-heavy trees, propose exact cleanup targets, and verify the result. It does not grant permission to delete user data.
-
-## What makes it different
-
-### APFS-aware accounting
-
-The scanner reports logical length, allocated blocks, and macOS private size. These values can diverge dramatically because of sparse files, clones, snapshots, and hard links. The report also keeps parent rankings visibly overlapping so totals are not accidentally double-counted.
-
-### Dynamic file-type discovery
-
-Extensions are counted dynamically, including extensionless files and unknown formats. Semantic categories are an interpretation layer for directory and format context; they never hide raw extension totals. Categories cover common Python/uv/pip/Conda, JavaScript/npm/pnpm/Yarn, Rust/Cargo, JVM, Go, .NET, Ruby, PHP, native C/C++, Android, iOS/macOS, Docker/Colima, AI models and datasets, databases, browsers/editors, and media tooling.
-
-### Small-file and text-file hotspots
-
-The report counts tiny files, small files, and small text files. This catches dependency trees, generated metadata, caches, indexes, and repositories that hurt backup and filesystem performance without appearing among the largest individual files.
-
-### Adaptive concurrency
-
-Directory workers are discovered rather than fixed. Interactive mode starts conservatively, probes useful concurrency, backs off when metadata latency or host load rises, and monitors the utility’s own CPU use. The ceiling is derived from logical CPUs, memory, file descriptors, and a generous safety cap, so the same binary can scale across Apple Silicon machines without assuming a particular core count. GPU work is intentionally not used: filesystem metadata enumeration is kernel and storage bound, not a GPU workload.
-
-### Native macOS metadata path
-
-The C shim batches directory metadata through `getattrlistbulk`; Rust performs classification and aggregation without launching a subprocess per file. The same native metadata layer is shared by the scanner and guarded cleaner.
-
-## Incremental scans
-
-For repeated agent checks, use the FSEvents-assisted incremental wrapper:
+## Incremental agent checks
 
 ```sh
 skills/reclaim-disk-space/scripts/incremental-disk-scout.sh \
@@ -129,34 +177,25 @@ skills/reclaim-disk-space/scripts/incremental-disk-scout.sh \
   /tmp/library-storage-cache
 ```
 
-The first run creates a full report and records an FSEvents starting point. Later runs reuse the report when nothing changed, or print dirty paths for a targeted rescan. It refuses to present a stale cache as current.
+The first run records an FSEvents starting point. Later runs reuse the report when nothing changed or print dirty paths for targeted rescans. A dirty or stale cache is never presented as current.
 
-## Limitations
+## Limitations worth knowing
 
 - macOS privacy controls and Full Disk Access can hide protected Mail, Messages, Photos, and application data.
-- Symbolic links are not followed.
-- Mounts on a different device are skipped.
+- Symbolic links are not followed; mounts on another device are skipped.
 - APFS firmlinks, clones, snapshots, and open files can make subtree sums differ from `df`.
-- Simulator runtimes, Docker/Colima volumes, editor databases, model weights, datasets, archives, credentials, and source trees require application-aware review.
-- This is macOS-specific; the scanner currently relies on macOS APIs and filesystem semantics.
+- Simulator runtimes, Docker/Colima volumes, editor databases, models, datasets, archives, credentials, and source trees require application-aware review.
+- Releases are currently Apple Silicon arm64 only; the source remains available for development and ports.
 
-## Development
+## Share the radar
 
-The project intentionally has no third-party Rust crates. Build scripts compile the C shim with `clang` and the Rust binaries with `rustc` using native optimization. Generated binaries are ignored by Git.
+If this helped you find the 200 GB your disk graph could not explain, star the project and share the [agent prompt](#give-your-agent-this-prompt). The useful unit of virality here is a reproducible before/after report—not a risky one-line deletion command.
 
-Tagged releases are built on an Apple Silicon GitHub-hosted runner and publish an arm64 archive plus SHA-256 checksums. The archive includes the Codex skill, the Rust scanner, the guarded cleaner, and the FSEvents helper.
-
-Before opening a pull request:
+## Development and license
 
 ```sh
 make build
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" skills/reclaim-disk-space
 ```
 
-If the validator is not available at that path, run the equivalent `quick_validate.py` from your Codex skill installation. Also test a read-only focused scan on a temporary directory and verify that deletion refuses broad roots.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [LICENSE](LICENSE).
