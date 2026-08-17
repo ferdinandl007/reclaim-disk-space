@@ -1,5 +1,7 @@
 # Reclaim Disk Space
 
+[![macOS CI](https://github.com/ferdinandl007/reclaim-disk-space/actions/workflows/ci.yml/badge.svg)](https://github.com/ferdinandl007/reclaim-disk-space/actions/workflows/ci.yml)
+
 Native, evidence-first disk auditing and guarded cleanup for macOS developer, AI, iOS, container, and media workstations.
 
 Most disk tools answer only “which files are large?” This project also answers:

@@ -1,0 +1,31 @@
+name: macOS CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-validate:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build native tools
+        run: make build
+
+      - name: Validate skill metadata
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          skill = Path("skills/reclaim-disk-space/SKILL.md").read_text()
+          assert skill.startswith("---\n")
+          frontmatter = skill.split("---\n", 2)[1]
+          assert "name: reclaim-disk-space" in frontmatter
+          assert "description:" in frontmatter
+          print("Skill metadata is valid")
+          PY
+
+      - name: Check formatting
+        run: git diff --check
+
